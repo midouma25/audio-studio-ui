@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import Sidebar from "./components/Sidebar";
 import Dropzone from "./components/Dropzone";
 import Terminal from "./components/Terminal";
@@ -6,11 +6,26 @@ import Transcript from "./components/Transcript";
 import WaveformPlayer from "./components/WaveformPlayer";
 import { processAudioWithAI } from "./services/assembly";
 
+// +++ التعديل 1: استدعاء العقل المدبر للذكاء الاصطناعي +++
+import { useAI } from "./hooks/useAI"; 
+
 export default function App() {
+  // +++ التعديل 2: استخراج حالة شبكة الذكاء الاصطناعي +++
+  const { isReady, transcriber } = useAI();
+
   const [logs, setLogs] = useState([
     "> [System] AI Audio Studio Initialized...",
     "> [System] Awaiting audio file input..."
   ]);
+
+  // +++ التعديل 3: مراقبة حالة الذكاء الاصطناعي وطباعتها في الـ Terminal +++
+  useEffect(() => {
+    if (!isReady) {
+      setLogs((prev) => [...prev, "> [System] Downloading AI Engine (Whisper-tiny) into browser... ⏳"]);
+    } else {
+      setLogs((prev) => [...prev, "> [AI] Neural Network is Online & Ready! 🧠"]);
+    }
+  }, [isReady]);
 
   const [activeFile, setActiveFile] = useState(null);
   const [processedFile, setProcessedFile] = useState(null);
@@ -78,7 +93,6 @@ export default function App() {
 
       if (!response.ok) throw new Error("Backend processing failed!");
 
-      // +++ التصحيح: هنا نستقبل الـ blob أولاً ثم نصنع الملف +++
       const blob = await response.blob();
       const newProcessedFile = new File([blob], `AI_Mastered_${activeFile.name}.wav`, { type: "audio/wav" });
       
@@ -110,8 +124,19 @@ export default function App() {
     
     if (toolName === "AI Transcribe") {
       if (isProcessing) return;
+      
+      // +++ حماية إضافية: التأكد من أن الذكاء الاصطناعي جاهز قبل التفريغ +++
+      if (!isReady) {
+        setLogs((prev) => [...prev, `> [Warning] AI Engine is still loading. Please wait...`]);
+        return;
+      }
+
       setIsProcessing(true);
+      
+      // سنترك الكود الخاص بك الذي يستخدم AssemblyAI حالياً كما هو
+      // حتى نقوم باستبداله بمحرك Transformers.js المحلي لاحقاً
       const words = await processAudioWithAI(activeFile, (msg) => setLogs(prev => [...prev, msg]));
+      
       if (words) {
         let segments = [];
         let currentSegment = { id: 0, startTime: 0, text: "" };
@@ -168,7 +193,8 @@ export default function App() {
   return (
     <div className="w-screen h-screen bg-[#020202] text-gray-200 flex overflow-hidden font-sans selection:bg-emerald-500/30">
       
-      <Sidebar onToolSelect={handleToolSelect} isProcessing={isProcessing} />
+      {/* تمرير حالة الذكاء الاصطناعي للشريط الجانبي لتعطيل الأزرار إذا لم يكن جاهزاً */}
+      <Sidebar onToolSelect={handleToolSelect} isProcessing={isProcessing} isAIReady={isReady} />
 
       <main className="flex-1 h-full flex flex-col p-4 gap-4 overflow-hidden relative bg-[#050505] border-x border-gray-800/40 min-w-0">
         
@@ -210,7 +236,6 @@ export default function App() {
             currentTime={currentTime} 
             onSeek={setSeekRequest} 
             transcriptData={transcriptData} 
-        
         />
       </aside>
 
