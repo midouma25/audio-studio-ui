@@ -193,22 +193,25 @@ export default function App() {
         </section>
 
         <section className="w-full flex-1 bg-[#0a0a0a] border border-gray-800/50 rounded-xl overflow-hidden p-5 shadow-inner relative min-h-0">
-          <Transcript 
-            currentTime={currentTime} 
-            onSeek={setSeekRequest} 
-            transcriptData={transcriptData} 
-          />
-        </section>
-      </main>
-
-      <aside className="w-[300px] shrink-0 h-full bg-[#050505] p-4 flex flex-col gap-3 z-20 overflow-hidden shadow-2xl">
-        <div className="text-[10px] text-gray-400 font-mono uppercase tracking-widest border-b border-gray-800/80 pb-2 flex justify-between items-center">
+         
+          <div className="text-[10px] text-gray-400 font-mono uppercase tracking-widest border-b border-gray-800/80 pb-2 flex justify-between items-center">
           <span className="flex items-center gap-2"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span> Action Logs</span>
           <span className="text-gray-600">v1.0.0</span>
         </div>
         <div className="flex-1 overflow-hidden rounded-lg bg-[#000000] border border-gray-800/40 shadow-inner">
           <Terminal logs={logs} />
         </div>
+        </section>
+
+      </main>
+
+      <aside className="w-[300px] shrink-0 h-full bg-[#050505] p-4 flex flex-col gap-3 z-20 overflow-hidden shadow-2xl">
+       <Transcript 
+            currentTime={currentTime} 
+            onSeek={setSeekRequest} 
+            transcriptData={transcriptData} 
+        
+        />
       </aside>
 
     </div>
