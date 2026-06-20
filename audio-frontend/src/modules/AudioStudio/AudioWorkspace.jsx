@@ -4,22 +4,59 @@ import StudioWaveform from "./components/StudioWaveform";
 import Transcript from "./components/Transcript";
 
 export default function AudioWorkspace({ onBack }) {
+  // 1. الحالات الأساسية للملف والمشغل
   const [audioFile, setAudioFile] = useState(null); 
-  const [activeTrack, setActiveTrack] = useState(null);
   const [currentTime, setCurrentTime] = useState(0); 
   const [isPlaying, setIsPlaying] = useState(false); 
   const [duration, setDuration] = useState(0);
 
+  // 2. حالات القفز الزمني (Click-to-Seek) والتحجيم المرن (Resize)
+  const [seekToTime, setSeekToTime] = useState(null);
+  const [timelineHeight, setTimelineHeight] = useState(288); 
+
+  // 3. محرك التراجع والتقدم (Undo/Redo Engine)
+  const [history, setHistory] = useState([{ isSplit: false, isEnhanced: false, transcriptionData: [] }]);
+  const [historyIndex, setHistoryIndex] = useState(0);
+  const currentState = history[historyIndex];
+  const { isSplit, isEnhanced, transcriptionData } = currentState;
+
+  // 4. حالات معالجة الـ API واللغات
   const [isProcessing, setIsProcessing] = useState(false);
   const [processLog, setProcessLog] = useState("");
-  const [isSplit, setIsSplit] = useState(false); 
-  const [isEnhanced, setIsEnhanced] = useState(false); 
-
   const [audioLanguage, setAudioLanguage] = useState("auto"); 
   const [translateTo, setTranslateTo] = useState("none");  
-  const [transcriptionData, setTranscriptionData] = useState([]);
 
   const ASSEMBLYAI_API_KEY = import.meta.env.VITE_ASSEMBLYAI_API_KEY; 
+
+  // --- دوال الأنظمة المساعدة ---
+  
+  const pushToHistory = (newStateChanges) => {
+    const updatedState = { ...currentState, ...newStateChanges };
+    const newHistory = history.slice(0, historyIndex + 1);
+    newHistory.push(updatedState);
+    setHistory(newHistory);
+    setHistoryIndex(newHistory.length - 1);
+  };
+
+  const undo = () => { if (historyIndex > 0) setHistoryIndex(historyIndex - 1); };
+  const redo = () => { if (historyIndex < history.length - 1) setHistoryIndex(historyIndex + 1); };
+
+  const handleDragStart = (e) => {
+    e.preventDefault();
+    const handleMouseMove = (mouseEvent) => {
+      const newHeight = window.innerHeight - mouseEvent.clientY;
+      // نضع حدوداً لكي لا يختفي التايم لاين أو يغطي الشاشة بأكملها
+      if (newHeight >= 150 && newHeight <= window.innerHeight - 200) {
+        setTimelineHeight(newHeight);
+      }
+    };
+    const handleMouseUp = () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+  };
 
   const formatTime = (timeInSeconds) => {
     const mins = Math.floor(timeInSeconds / 60);
@@ -36,139 +73,132 @@ export default function AudioWorkspace({ onBack }) {
 
   const handleFileReceived = (file) => {
     setAudioFile(file);
-    setIsSplit(false); 
-    setIsEnhanced(false);
-    setTranscriptionData([]); 
+    // تصفير التاريخ عند رفع ملف جديد
+    setHistory([{ isSplit: false, isEnhanced: false, transcriptionData: [] }]);
+    setHistoryIndex(0);
   };
+
+  // --- دوال فلاتر الذكاء الاصطناعي ---
 
   const applyAIFilter = (filterName) => {
     if (!audioFile) return alert("⚠️ Please load an audio file first!");
     if (isProcessing) return;
+    
     setIsProcessing(true);
     setProcessLog(`[System] Initializing ${filterName}...`);
 
     setTimeout(() => {
-      setProcessLog(`[AI] Analyzing audio frequencies & isolating nodes... ⏳`);
+      setProcessLog(`[AI] Analyzing audio frequencies... ⏳`);
     }, 1500);
 
     setTimeout(() => {
       setIsProcessing(false);
       setProcessLog(""); 
-      if (filterName === "Vocal & BGM Splitter") setIsSplit(true);
-      setIsEnhanced(true); 
+      if (filterName === "Vocal & BGM Splitter") pushToHistory({ isSplit: true });
+      if (filterName === "AI Studio Enhance") pushToHistory({ isEnhanced: true });
     }, 4000); 
   };
 
   const handleTranscribeWithAPI = async () => {
     if (!audioFile) return alert("⚠️ Load an audio file first!");
-    if (!ASSEMBLYAI_API_KEY || ASSEMBLYAI_API_KEY === "undefined") {
-      return alert("⚠️ Missing API Key! Check your .env file.");
-    }
+    if (!ASSEMBLYAI_API_KEY || ASSEMBLYAI_API_KEY === "undefined") return alert("⚠️ Missing API Key!");
 
     setIsProcessing(true);
     setProcessLog("🚀 [1/4] Uploading audio to Cloud AI...");
 
     try {
+      // 1. Upload
       const uploadResponse = await fetch("https://api.assemblyai.com/v2/upload", {
         method: "POST",
         headers: { 
-          "authorization": ASSEMBLYAI_API_KEY,
-          "Content-Type": "application/octet-stream"
+          "authorization": ASSEMBLYAI_API_KEY, 
+          "Content-Type": "application/octet-stream" 
         },
         body: audioFile,
       });
-
       const uploadData = await uploadResponse.json();
-      if (!uploadResponse.ok) throw new Error(`Upload Failed: ${uploadData.error}`);
-      const uploadUrl = uploadData.upload_url;
+      if (!uploadResponse.ok) throw new Error(uploadData.error);
 
+      // 2. Transcribe Request
       setProcessLog("🧠 [2/4] Extracting text...");
       const transcriptResponse = await fetch("https://api.assemblyai.com/v2/transcript", {
         method: "POST",
-        headers: {
-          "authorization": ASSEMBLYAI_API_KEY,
-          "Content-Type": "application/json",
+        headers: { 
+          "authorization": ASSEMBLYAI_API_KEY, 
+          "Content-Type": "application/json" 
         },
         body: JSON.stringify({
-          audio_url: uploadUrl,
-          language_detection: audioLanguage === "auto" ? true : false,
+          audio_url: uploadData.upload_url,
+          language_detection: audioLanguage === "auto",
           language_code: audioLanguage !== "auto" ? audioLanguage : undefined,
         }),
       });
-
       const transcriptDataReq = await transcriptResponse.json();
-      if (!transcriptResponse.ok) throw new Error(`Request Failed: ${transcriptDataReq.error}`);
-      const transcriptId = transcriptDataReq.id;
+      if (!transcriptResponse.ok) throw new Error(transcriptDataReq.error);
 
-      setProcessLog("⏳ [3/4] Structuring sentences... Please wait.");
+      // 3. Polling
+      setProcessLog("⏳ [3/4] Structuring sentences...");
       let status = "queued";
       let finalResult = null;
-
+      
       while (status === "queued" || status === "processing") {
         await new Promise((resolve) => setTimeout(resolve, 3000));
-        const pollingResponse = await fetch(`https://api.assemblyai.com/v2/transcript/${transcriptId}`, {
-          headers: { "authorization": ASSEMBLYAI_API_KEY },
+        const pollingResponse = await fetch(`https://api.assemblyai.com/v2/transcript/${transcriptDataReq.id}`, { 
+          headers: { "authorization": ASSEMBLYAI_API_KEY } 
         });
         finalResult = await pollingResponse.json();
         status = finalResult.status;
-        if (status === "error") throw new Error(`AssemblyAI Error: ${finalResult.error}`);
+        if (status === "error") throw new Error(finalResult.error);
       }
 
+      // 4. Processing & Translation
       if (finalResult && finalResult.words && finalResult.words.length > 0) {
         const groupedChunks = [];
         let currentChunk = [];
-
-        // 1. تجميع الكلمات المفرقة إلى جمل
+        
         for (let i = 0; i < finalResult.words.length; i++) {
           currentChunk.push(finalResult.words[i]);
+          
           const isPause = finalResult.words[i+1] && (finalResult.words[i+1].start - finalResult.words[i].end > 400);
           const isTooLong = currentChunk.length >= 10;
           const isLastWord = i === finalResult.words.length - 1;
 
           if (isPause || isTooLong || isLastWord) {
-            const originalText = currentChunk.map(w => w.text).join(audioLanguage === 'ja' ? "" : " ");
             groupedChunks.push({
               id: groupedChunks.length,
               startTime: currentChunk[0].start / 1000,
               endTime: currentChunk[currentChunk.length - 1].end / 1000,
-              text: originalText,
-              translatedText: null, // سيتم تعبئتها في الخطوة القادمة
+              text: currentChunk.map(w => w.text).join(audioLanguage === 'ja' ? "" : " "),
+              translatedText: null,
               timeString: formatShortTime(currentChunk[0].start / 1000)
             });
             currentChunk = [];
           }
         }
 
-        // 2. +++ سحر الترجمة الحقيقي عبر الـ API +++
         if (translateTo !== "none") {
-          // جلب اللغة التي اكتشفها الذكاء الاصطناعي (أو استخدام اللغة الافتراضية)
-          const detectedLang = finalResult.language_code || (audioLanguage === "auto" ? "ja" : audioLanguage);
-          
+          const detectedLang = finalResult.language_code || "ja";
           for (let i = 0; i < groupedChunks.length; i++) {
             setProcessLog(`🌍 [4/4] Translating subtitles... (${i + 1}/${groupedChunks.length})`);
             try {
-              // استدعاء MyMemory Translation API مجاناً
               const res = await fetch(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(groupedChunks[i].text)}&langpair=${detectedLang}|${translateTo}`);
               const data = await res.json();
-              if (data && data.responseData && data.responseData.translatedText) {
+              if (data?.responseData?.translatedText) {
                 groupedChunks[i].translatedText = data.responseData.translatedText;
               }
-            } catch (e) {
-              console.error("Translation Error on chunk:", i, e);
+            } catch (e) { 
+              console.error("Translation Error", e); 
             }
-            // تأخير زمني بسيط جداً لتجنب حظر الـ API المجاني لنا
             await new Promise(r => setTimeout(r, 400));
           }
         }
-
-        // إرسال البيانات المجمعة والمترجمة إلى واجهة المستخدم
-        setTranscriptionData(groupedChunks);
+        
+        // حفظ المخرجات في التاريخ (Undo/Redo)
+        pushToHistory({ transcriptionData: groupedChunks });
       } else {
-        alert("⚠️ AI couldn't detect any clear speech in this file.");
+        alert("⚠️ AI couldn't detect any clear speech.");
       }
-
     } catch (error) {
-      console.error("[API ERROR]:", error);
       alert(`❌ Error: ${error.message}`);
     } finally {
       setIsProcessing(false);
@@ -191,10 +221,13 @@ export default function AudioWorkspace({ onBack }) {
   return (
     <div className="h-screen w-full bg-[#030303] text-gray-200 flex flex-col overflow-hidden font-sans select-none">
       
-      {/* 1. Header */}
+      {/* --- 1. Header --- */}
       <header className="h-14 shrink-0 border-b border-gray-900/60 flex items-center justify-between px-6 bg-[#080808]/90 backdrop-blur-md z-30">
         <div className="flex items-center gap-4">
-          <button onClick={onBack} className="text-gray-400 hover:text-white transition-all text-sm font-medium flex items-center gap-1 bg-gray-900/40 hover:bg-gray-800/60 px-3 py-1.5 rounded-lg border border-gray-800/50">
+          <button 
+            onClick={onBack} 
+            className="text-gray-400 hover:text-white transition-all text-sm font-medium flex items-center gap-1 bg-gray-900/40 hover:bg-gray-800/60 px-3 py-1.5 rounded-lg border border-gray-800/50"
+          >
             ← Dashboard
           </button>
           <span className="text-gray-800">|</span>
@@ -205,40 +238,77 @@ export default function AudioWorkspace({ onBack }) {
         </div>
 
         <div className="flex items-center gap-4">
+          
+          {/* أزرار التراجع والتقدم */}
+          <div className="flex items-center gap-2 mr-2 border-r border-gray-800 pr-4">
+            <button 
+              onClick={undo} 
+              disabled={historyIndex === 0} 
+              className="p-1.5 text-gray-400 hover:text-white disabled:opacity-30 transition-opacity" 
+              title="Undo Action"
+            >
+              ↩️
+            </button>
+            <button 
+              onClick={redo} 
+              disabled={historyIndex === history.length - 1} 
+              className="p-1.5 text-gray-400 hover:text-white disabled:opacity-30 transition-opacity" 
+              title="Redo Action"
+            >
+              ↪️
+            </button>
+          </div>
+
+          {/* أزرار التحميل */}
           {audioFile && (
             <div className="flex items-center gap-2 mr-4 border-r border-gray-800 pr-4">
-              <button onClick={() => downloadAudio()} className="flex items-center gap-2 px-3 py-1.5 bg-gray-900 hover:bg-gray-800 border border-gray-700 text-gray-300 text-xs font-medium rounded transition-colors">
+              <button 
+                onClick={() => downloadAudio()} 
+                className="flex items-center gap-2 px-3 py-1.5 bg-gray-900 hover:bg-gray-800 border border-gray-700 text-gray-300 text-xs font-medium rounded transition-colors"
+              >
                 📥 Original
               </button>
               {(isSplit || isEnhanced) && (
-                <button onClick={() => downloadAudio("AI_Mastered")} className="flex items-center gap-2 px-3 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-400 font-bold text-xs rounded transition-colors shadow-[0_0_10px_rgba(16,185,129,0.2)]">
+                <button 
+                  onClick={() => downloadAudio("AI_Mastered")} 
+                  className="flex items-center gap-2 px-3 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-400 font-bold text-xs rounded transition-colors shadow-[0_0_10px_rgba(16,185,129,0.2)]"
+                >
                   ✨ Export Processed
                 </button>
               )}
             </div>
           )}
+
           <div className="font-mono text-xs text-gray-500 tracking-widest bg-black/40 px-3 py-1.5 rounded-md border border-gray-900">
             TOTAL TIME: <span className="text-emerald-400 font-bold">{formatTime(duration)}</span>
           </div>
         </div>
       </header>
 
-      {/* 2. Main Workspace */}
+      {/* --- 2. Main Workspace --- */}
       <div className="flex-1 flex overflow-hidden min-h-0 relative">
         
         {/* Sidebar Tools */}
         <aside className="w-72 shrink-0 bg-[#060606] border-r border-gray-950 p-4 flex flex-col gap-4 overflow-y-auto min-w-0 relative">
-          <div className="text-[10px] font-mono uppercase tracking-wider text-gray-600 shrink-0">Neural Audio Filters</div>
+          <div className="text-[10px] font-mono uppercase tracking-wider text-gray-600 shrink-0">
+            Neural Audio Filters
+          </div>
           
-          <button onClick={() => applyAIFilter("Vocal & BGM Splitter")} disabled={isProcessing} className={`w-full shrink-0 bg-[#0a0a0a] border ${isProcessing ? 'border-gray-900 opacity-50 cursor-not-allowed' : 'border-gray-900 hover:border-emerald-500/40'} p-3 rounded-xl text-left transition-all group`}>
+          <button 
+            onClick={() => applyAIFilter("Vocal & BGM Splitter")} 
+            disabled={isProcessing} 
+            className={`w-full shrink-0 bg-[#0a0a0a] border ${isProcessing ? 'border-gray-900 opacity-50 cursor-not-allowed' : 'border-gray-900 hover:border-emerald-500/40'} p-3 rounded-xl text-left transition-all group`}
+          >
             <div className="flex items-center gap-3 mb-1">
               <span className="text-xl group-hover:scale-110 transition-transform">🎛️</span>
               <span className="text-sm font-semibold text-gray-200">Vocal & BGM Splitter</span>
             </div>
-            <p className="text-[11px] text-gray-500 leading-relaxed">Extract crystal clear acapella and background music.</p>
+            <p className="text-[11px] text-gray-500 leading-relaxed">
+              Extract crystal clear acapella and background music.
+            </p>
           </button>
 
-          {/* لوحة هندسة الترجمة والتفريغ */}
+          {/* Cloud AI API Panel */}
           <div className="w-full shrink-0 bg-[#090a0e]/60 border border-purple-500/20 p-3 rounded-xl flex flex-col gap-3 relative overflow-hidden">
             <div className="absolute top-0 right-0 w-12 h-12 bg-purple-500/5 rounded-full blur-xl"></div>
             <div className="flex items-center gap-3">
@@ -250,8 +320,8 @@ export default function AudioWorkspace({ onBack }) {
               <label className="text-[9px] font-mono text-gray-500 uppercase tracking-wider">Audio Language</label>
               <select 
                 value={audioLanguage} 
-                onChange={(e) => setAudioLanguage(e.target.value)}
-                className="bg-[#040404] border border-gray-800 text-xs rounded-lg p-2 text-gray-300 focus:border-purple-500/50 outline-none cursor-pointer"
+                onChange={(e) => setAudioLanguage(e.target.value)} 
+                className="bg-[#040404] border border-gray-800 text-xs rounded-lg p-2 text-gray-300 outline-none cursor-pointer"
               >
                 <option value="auto">Auto Detect Language</option>
                 <option value="ja">Japanese (日本語)</option>
@@ -264,8 +334,8 @@ export default function AudioWorkspace({ onBack }) {
               <label className="text-[9px] font-mono text-gray-500 uppercase tracking-wider">Machine Translation</label>
               <select 
                 value={translateTo} 
-                onChange={(e) => setTranslateTo(e.target.value)}
-                className="bg-[#040404] border border-gray-800 text-xs rounded-lg p-2 text-purple-300 font-medium focus:border-purple-500/50 outline-none cursor-pointer"
+                onChange={(e) => setTranslateTo(e.target.value)} 
+                className="bg-[#040404] border border-gray-800 text-xs rounded-lg p-2 text-purple-300 font-medium outline-none cursor-pointer"
               >
                 <option value="none">⚠️ Keep Original Language</option>
                 <option value="ar">Translate to Arabic (العربية)</option>
@@ -276,61 +346,69 @@ export default function AudioWorkspace({ onBack }) {
             <button 
               onClick={handleTranscribeWithAPI} 
               disabled={isProcessing} 
-              className="w-full mt-2 py-2.5 z-10 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-bold text-xs rounded-lg transition-all shadow-[0_0_15px_rgba(147,51,234,0.2)] disabled:opacity-40"
+              className="w-full mt-2 py-2.5 z-10 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 text-white font-bold text-xs rounded-lg transition-all disabled:opacity-40 shadow-[0_0_15px_rgba(147,51,234,0.2)]"
             >
               Fetch API Transcript
             </button>
           </div>
 
-          <button onClick={() => applyAIFilter("AI Studio Enhance")} disabled={isProcessing} className={`w-full shrink-0 bg-[#0a0a0a] border ${isProcessing ? 'border-gray-900 opacity-50 cursor-not-allowed' : 'border-gray-900 hover:border-emerald-500/40'} p-3 rounded-xl text-left transition-all group`}>
+          <button 
+            onClick={() => applyAIFilter("AI Studio Enhance")} 
+            disabled={isProcessing} 
+            className={`w-full shrink-0 bg-[#0a0a0a] border ${isProcessing ? 'border-gray-900 opacity-50 cursor-not-allowed' : 'border-gray-900 hover:border-emerald-500/40'} p-3 rounded-xl text-left transition-all group`}
+          >
             <div className="flex items-center gap-3 mb-1">
               <span className="text-xl group-hover:scale-110 transition-transform">✨</span>
               <span className="text-sm font-semibold text-gray-200">AI Studio Enhance</span>
             </div>
-            <p className="text-[11px] text-gray-500 leading-relaxed">Automatically balance frequencies (EQ) and compress.</p>
+            <p className="text-[11px] text-gray-500 leading-relaxed">
+              Automatically balance frequencies (EQ) and compress.
+            </p>
           </button>
 
           {isProcessing && (
             <div className="absolute bottom-4 left-4 right-4 bg-[#081510]/95 border border-emerald-500/30 p-3 rounded-xl backdrop-blur-sm animate-pulse shadow-lg z-50">
               <div className="text-[10px] text-emerald-400 font-mono flex items-center gap-2 mb-1">
                 <span className="w-2 h-2 bg-emerald-400 rounded-full animate-ping"></span>
-                PROCESSING API REQUEST...
+                PROCESSING...
               </div>
-              <div className="text-xs text-gray-300 font-mono leading-tight">{processLog}</div>
+              <div className="text-xs text-gray-300 font-mono leading-tight">
+                {processLog}
+              </div>
             </div>
           )}
         </aside>
 
         {/* Waveform Stage & Transcript Panel Split */}
         <main className="flex-1 bg-[#040404] p-6 flex flex-row items-center justify-center relative min-w-0 z-10 shadow-[-10px_0_30px_rgba(0,0,0,0.5)] gap-6 overflow-hidden">
-          {!audioFile ? (
-            <SmartDropzone onFileDrop={handleFileReceived} />
+          {!audioFile ? ( 
+            <SmartDropzone onFileDrop={handleFileReceived} /> 
           ) : (
             <>
-              {/* حاوية الموجة الصوتية */}
+              {/* Waveform Container */}
               <div className="flex-1 flex flex-col items-center justify-center w-full max-w-5xl transition-all duration-500">
                 <StudioWaveform 
                   file={audioFile} 
-                  onClear={() => {
-                    setAudioFile(null);
-                    setCurrentTime(0);
-                    setDuration(0);
-                    setIsSplit(false);
-                    setIsEnhanced(false);
-                    setTranscriptionData([]);
+                  onClear={() => { 
+                    setAudioFile(null); 
+                    setCurrentTime(0); 
+                    setDuration(0); 
+                    setHistoryIndex(0); 
+                    setHistory([{ isSplit: false, isEnhanced: false, transcriptionData: [] }]);
                   }} 
                   onTimeUpdate={setCurrentTime}
                   onPlayStateChange={setIsPlaying}
                   onDurationChange={setDuration}
+                  seekToTime={seekToTime} 
                 />
               </div>
 
-              {/* لوحة النصوص الجانبية */}
+              {/* Dynamic Transcript Panel */}
               {transcriptionData && transcriptionData.length > 0 && (
                 <div className="w-80 h-full max-h-[450px] bg-[#0a0a0a]/90 backdrop-blur-md border border-gray-800 rounded-xl shadow-2xl p-4 flex flex-col overflow-hidden animate-fade-in transition-all">
                   <Transcript 
                     currentTime={currentTime} 
-                    onSeek={(time) => console.log("Seek to:", time)} 
+                    onSeek={(time) => setSeekToTime(time)} 
                     transcriptData={transcriptionData} 
                   />
                 </div>
@@ -339,9 +417,23 @@ export default function AudioWorkspace({ onBack }) {
           )}
         </main>
       </div>
-{/* 3. The Pro Timeline */}
-      <footer className="h-72 shrink-0 bg-[#070707] border-t border-gray-900 flex flex-col min-h-0 z-20 relative">
-        <div className="h-10 border-b border-gray-900 bg-[#0a0a0a] px-4 flex items-center justify-between text-xs text-gray-500 font-mono relative z-20">
+
+      {/* --- 3. Timeline Resizer (Draggable Splitter) --- */}
+      <div 
+        onMouseDown={handleDragStart}
+        className="h-1.5 w-full bg-gray-900 hover:bg-emerald-500/50 cursor-ns-resize flex items-center justify-center z-50 transition-colors"
+        title="Drag to resize timeline"
+      >
+        <div className="w-12 h-[2px] bg-gray-500 rounded-full pointer-events-none"></div>
+      </div>
+
+      {/* --- 4. The Pro Timeline --- */}
+      <footer 
+        className="shrink-0 bg-[#070707] flex flex-col min-h-0 z-20 relative" 
+        style={{ height: `${timelineHeight}px` }}
+      >
+        {/* Timeline Tools */}
+        <div className="h-10 border-b border-gray-900 bg-[#0a0a0a] px-4 flex items-center justify-between text-xs text-gray-500 font-mono relative z-20 shrink-0">
           <div className="flex items-center gap-4">
             <button className="flex items-center gap-1 hover:text-emerald-400 transition-colors">
               <span className="text-sm">▶</span> Play
@@ -359,25 +451,18 @@ export default function AudioWorkspace({ onBack }) {
           </div>
         </div>
 
+        {/* Tracks Area */}
         <div className="flex-1 overflow-y-auto flex flex-col relative">
           
-          {/* خلفية التايم لاين المخططة */}
-          <div className="absolute top-0 bottom-0 left-56 right-0 pointer-events-none" style={{
-            backgroundImage: "repeating-linear-gradient(90deg, transparent, transparent 99px, #111 99px, #111 100px)",
-            backgroundSize: "100px 100%"
-          }}></div>
+          {/* Grid Background */}
+          <div className="absolute top-0 bottom-0 left-56 right-0 pointer-events-none" style={{ backgroundImage: "repeating-linear-gradient(90deg, transparent, transparent 99px, #111 99px, #111 100px)", backgroundSize: "100px 100%"}}></div>
 
-          {/* +++ المؤشر الأحمر الدقيق والسلس (Playhead Fix) +++ */}
+          {/* Smooth Playhead */}
           {audioFile && duration > 0 && (
             <div className="absolute top-0 bottom-0 left-56 right-0 z-50 pointer-events-none">
               <div 
-                // ❌ أزلنا transition-all تماماً لأنها كانت تسبب الاهتزاز والقفز
-                className="absolute top-0 bottom-0 w-[2px] bg-red-600 shadow-[0_0_12px_rgba(220,38,38,1)]"
-                style={{ 
-                  // التأكد من أن المؤشر لا يتخطى نسبة 100%
-                  left: `${Math.min((currentTime / duration) * 100, 100)}%`,
-                  willChange: 'left' // تسليم حركة المؤشر لكرت الشاشة ليكون ناعماً كالحرير
-                }}
+                className="absolute top-0 bottom-0 w-[2px] bg-red-600 shadow-[0_0_12px_rgba(220,38,38,1)]" 
+                style={{ left: `${Math.min((currentTime / duration) * 100, 100)}%`, willChange: 'left' }}
               >
                 <div className="absolute top-0 left-[-5px] w-0 h-0 border-l-[6px] border-r-[6px] border-t-[8px] border-transparent border-t-red-600"></div>
               </div>
@@ -396,9 +481,7 @@ export default function AudioWorkspace({ onBack }) {
                 <div className="h-full bg-emerald-500/50 w-full"></div>
               </div>
             </div>
-            
-            {/* أزلنا الحواف (Paddings) لكي يطابق المقطع الصوتي نفس مسار المؤشر الأحمر 100% */}
-            <div className="flex-1 h-full relative flex items-center py-2">
+            <div className="flex-1 h-full relative flex items-center py-2 px-1">
               {audioFile && (
                 <div className="h-12 w-full bg-gradient-to-r from-emerald-900/80 to-emerald-800/40 border border-emerald-500/40 rounded-r-md flex flex-col justify-center px-3 text-xs font-mono text-emerald-300 relative overflow-hidden shadow-lg">
                   <div className="absolute top-0 left-0 bottom-0 w-1 bg-emerald-400"></div>
@@ -421,8 +504,7 @@ export default function AudioWorkspace({ onBack }) {
                 <div className="h-full bg-cyan-500/50 w-full"></div>
               </div>
             </div>
-            
-            <div className="flex-1 h-full relative flex items-center py-2">
+            <div className="flex-1 h-full relative flex items-center py-2 px-1">
               {isSplit && (
                 <div className="h-12 w-full bg-gradient-to-r from-cyan-900/80 to-cyan-800/40 border border-cyan-500/40 rounded-r-md flex flex-col justify-center px-3 text-xs font-mono text-cyan-300 relative overflow-hidden shadow-lg animate-fade-in">
                   <div className="absolute top-0 left-0 bottom-0 w-1 bg-cyan-400"></div>

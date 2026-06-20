@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import WaveSurfer from 'wavesurfer.js';
 
-// +++ 1. أضفنا onDurationChange في الخصائص +++
-export default function StudioWaveform({ file, onClear, onTimeUpdate, onPlayStateChange, onDurationChange }) {
+export default function StudioWaveform({ file, onClear, onTimeUpdate, onPlayStateChange, onDurationChange, seekToTime }) {
   const containerRef = useRef(null);
   const wavesurferRef = useRef(null);
   const [isPlaying, setIsPlaying] = useState(false);
 
+  // 1. محرك بناء الموجة (يجب أن يكون داخل useEffect ليتم بعد بناء الشاشة)
   useEffect(() => {
     if (!file || !containerRef.current) return;
 
@@ -31,12 +31,10 @@ export default function StudioWaveform({ file, onClear, onTimeUpdate, onPlayStat
       if (onDurationChange) onDurationChange(ws.getDuration());
     });
 
-    // +++ 2. إرسال الوقت الحالي للأب مع كل جزء من الثانية يمر +++
     ws.on('timeupdate', (currentTime) => {
       if (onTimeUpdate) onTimeUpdate(currentTime);
     });
 
-    // +++ 3. إخبار الأب عند التشغيل أو الإيقاف +++
     ws.on('play', () => {
       setIsPlaying(true);
       if (onPlayStateChange) onPlayStateChange(true);
@@ -56,7 +54,14 @@ export default function StudioWaveform({ file, onClear, onTimeUpdate, onPlayStat
       ws.destroy();
       URL.revokeObjectURL(objectUrl);
     };
-  }, [file]);
+  }, [file, onDurationChange, onPlayStateChange, onTimeUpdate]);
+
+  // 2. محرك القفز الزمني (يتفاعل فقط عندما تضغط على النص الجانبي)
+  useEffect(() => {
+    if (wavesurferRef.current && seekToTime !== null && seekToTime !== undefined) {
+      wavesurferRef.current.setTime(seekToTime);
+    }
+  }, [seekToTime]);
 
   const togglePlay = () => {
     if (wavesurferRef.current) {
