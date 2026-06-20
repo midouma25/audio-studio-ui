@@ -95,11 +95,21 @@ export default function Transcript({ currentTime, onSeek, transcriptData }) {
                 }`}>
                   {segment.timeString}
                 </span>
-                <p className={`text-lg transition-colors duration-200 leading-relaxed ${
-                  activeId === segment.id ? "text-gray-100 bg-emerald-500/10 rounded px-1 -ml-1" : "text-gray-500 group-hover:text-gray-300"
-                }`}>
-                  {segment.text}
-                </p>
+                {/* النص الأصلي */}
+  <p className={`text-lg transition-colors duration-200 leading-relaxed ${
+    activeId === segment.id ? "text-gray-100 bg-emerald-500/10 rounded px-1 -ml-1" : "text-gray-500 group-hover:text-gray-300"
+  }`}>
+    {segment.text}
+  </p>
+
+  {/* +++ عرض الترجمة إن وجدت +++ */}
+  {segment.translatedText && (
+    <p className={`text-sm mt-1 transition-colors duration-200 italic ${
+      activeId === segment.id ? "text-purple-400" : "text-purple-900/50 group-hover:text-purple-600/80"
+    }`}>
+      {segment.translatedText}
+    </p>
+  )}
               </div>
             ))}
           </div>
