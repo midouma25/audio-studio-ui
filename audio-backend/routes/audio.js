@@ -210,7 +210,7 @@ router.get('/transcript/:id', async (req, res, next) => {
 // routes/audio.js
 
 // ==========================================
-// ✂️ ميزة القص الذكي للفراغات (Smart Silence Trimmer)
+// ✂️ ميزة القص الذكي للفراغات (Smart Silence Trimmer - V3 Absolute Engine)
 // ==========================================
 router.post('/trim-silence/:id', protect, async (req, res, next) => {
     try {
@@ -222,50 +222,66 @@ router.post('/trim-silence/:id', protect, async (req, res, next) => {
         if (!transcript) return res.status(404).json({ error: "Project not found" });
 
         let originalChunks = transcript.chunks;
-        if (originalChunks.length <= 1) {
-            return res.status(200).json({ chunks: originalChunks, timeSaved: 0, keptRegions: [], message: "Audio too short." });
+        if (originalChunks.length === 0) {
+            return res.status(200).json({ chunks: [], timeSaved: 0, keptRegions: [], message: "No audio chunks found." });
         }
 
-        let trimmedChunks = [];
-        let timeOffset = 0; 
-        
-        // +++ تحديث الشراسة: عتبات أقل وقص أدق +++
-        // الخيار الصارم: يقص أي فراغ أكبر من 0.15 ثانية (بدلاً من 0.3)
-        // الخيار الطبيعي: يقص أي فراغ أكبر من 0.8 ثانية (بدلاً من 1.2)
+        // إعدادات الشراسة
         const maxAllowedSilence = mode === "ai_speech" ? 0.15 : 0.8; 
-        
-        // حواف الأمان: 0.05 ثانية فقط للخيار الصارم لكي لا يترك هواءً زائداً
         const padding = mode === "ai_speech" ? 0.05 : 0.2;
 
+        // 1. صناعة خريطة مبدئية لأماكن الكلمات فقط (مع إضافة حواف الأمان)
+        let rawRegions = originalChunks.map(c => ({
+            start: Math.max(0, c.startTime - padding),
+            end: c.endTime + padding
+        }));
+
+        // 2. دمج المناطق المتقاربة (هنا نقرر ما سنحتفظ به بدقة متناهية)
         let keptRegions = [];
-        let currentKeepStart = 0;
-
-        trimmedChunks.push({ ...originalChunks[0].toObject(), id: 0 });
-
-        for (let i = 1; i < originalChunks.length; i++) {
-            const prevChunk = originalChunks[i - 1];
-            const currentChunk = originalChunks[i];
-            const silenceDuration = currentChunk.startTime - prevChunk.endTime;
-
-            if (silenceDuration > maxAllowedSilence) {
-                // حفظ المنطقة مع حافة أمان صغيرة جداً
-                keptRegions.push({ start: currentKeepStart, end: prevChunk.endTime + padding });
-                currentKeepStart = currentChunk.startTime - padding;
-                
-                // حساب الوقت المقطوع الحقيقي (بعد خصم حواف الأمان من الطرفين)
-                const amountToTrim = silenceDuration - (padding * 2);
-                timeOffset += amountToTrim; 
+        if (rawRegions.length > 0) {
+            let current = rawRegions[0];
+            for (let i = 1; i < rawRegions.length; i++) {
+                const gap = originalChunks[i].startTime - originalChunks[i-1].endTime;
+                if (gap <= maxAllowedSilence) {
+                    // الكلمات متقاربة: قم بدمجها في منطقة واحدة مستمرة
+                    current.end = Math.max(current.end, rawRegions[i].end);
+                } else {
+                    // الكلمات متباعدة: احفظ المنطقة الحالية، وابدأ منطقة جديدة (مما يعني حذف الفراغ بينهما)
+                    keptRegions.push({...current});
+                    current = rawRegions[i];
+                }
             }
+            keptRegions.push({...current});
+        }
 
-            const newStartTime = currentChunk.startTime - timeOffset;
-            const newEndTime = currentChunk.endTime - timeOffset;
+        // 3. محرك الترجمة الزمنية (حساب التوقيت الجديد لكل كلمة بعد ضغط الملف الفيزيائي)
+        const getNewTime = (oldTime) => {
+            let newTime = 0;
+            for (let region of keptRegions) {
+                if (oldTime < region.start) break;
+                if (oldTime >= region.start && oldTime <= region.end) {
+                    newTime += (oldTime - region.start);
+                    break;
+                }
+                if (oldTime > region.end) {
+                    newTime += (region.end - region.start);
+                }
+            }
+            return newTime;
+        };
+
+        let trimmedChunks = [];
+        for (let i = 0; i < originalChunks.length; i++) {
+            const currentChunk = originalChunks[i];
+            const newStartTime = getNewTime(currentChunk.startTime);
+            const newEndTime = getNewTime(currentChunk.endTime);
 
             const mins = Math.floor(newStartTime / 60);
             const secs = Math.floor(newStartTime % 60);
             const newTimeString = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 
             trimmedChunks.push({
-                id: trimmedChunks.length,
+                id: i,
                 startTime: newStartTime,
                 endTime: newEndTime,
                 text: currentChunk.text,
@@ -275,19 +291,20 @@ router.post('/trim-silence/:id', protect, async (req, res, next) => {
             });
         }
 
-        keptRegions.push({ start: currentKeepStart, end: 999999 });
-
-        // إضافة آخر منطقة صالحة حتى نهاية الملف الصوتي
-        keptRegions.push({ start: currentKeepStart, end: 999999 });
-
         transcript.chunks = trimmedChunks;
         await transcript.save();
 
-        console.log(`✅ [AI Tool] Silence trimmed! Offset removed: ${timeOffset.toFixed(2)}s`);
+        // 4. حساب الثواني المحذوفة (الفراغ في البداية + الفراغات البينية)
+        let timeSaved = keptRegions[0].start; 
+        for (let i = 1; i < keptRegions.length; i++) {
+            timeSaved += (keptRegions[i].start - keptRegions[i - 1].end);
+        }
+
+        console.log(`✅ [AI Tool] Absolute Trim Complete! Time saved: ${timeSaved.toFixed(2)}s`);
         res.status(200).json({ 
             chunks: trimmedChunks, 
-            timeSaved: timeOffset,
-            keptRegions: keptRegions // +++ إرسال الخريطة للفرونت إند +++
+            timeSaved: timeSaved,
+            keptRegions: keptRegions // الآن لا يوجد 999999، المنطقة محددة بدقة!
         });
 
     } catch (error) {
