@@ -71,59 +71,73 @@ function bufferToWave(abuffer, len) {
   };
 
 // --- دالة تشغيل القص (مع صائد الأخطاء الشامل) ---
+// --- دالة القص الذكي (ترسم فقط ولا تقطع) ---
   const handleSmartTrimSilence = async () => {
-    if (!activeTranscriptId) return alert("⚠️ Please load or fetch a project transcript from API first!");
+    if (!activeTranscriptId) return alert("⚠️ Please load or fetch an API Transcript first!");
     setIsProcessing(true);
-    setProcessLog(`✂️ Scanning timeline using [${trimmerMode === 'ai_speech' ? 'AI Speech' : 'Acoustic'}] mode...`);
+    setProcessLog(`✂️ Scanning timeline for dead air...`);
     
     try {
-      console.log("🚀 [Trim] Sending request to Backend...");
       const token = localStorage.getItem("token");
       const response = await fetch(`http://localhost:5000/api/trim-silence/${activeTranscriptId}`, {
         method: "POST",
-        headers: { 
-          "Authorization": `Bearer ${token}`,
-          "Content-Type": "application/json" 
-        },
+        headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ mode: trimmerMode })
       });
       
-      if (!response.ok) throw new Error("Failed to trim silence from backend");
+      if (!response.ok) throw new Error("Backend response not OK");
       const data = await response.json();
-      
-      console.log("📥 [Trim] Backend Response:", data);
 
-      // +++ السحر الفيزيائي + صائد الأخطاء +++
-      if (data.keptRegions && data.keptRegions.length > 0 && data.timeSaved > 0) {
-        setProcessLog("✂️ Physically slicing and stitching the audio file in browser... ⏳");
-        try {
-            console.log("⚙️ [Trim] Slicing audio in browser...");
-            const trimmedAudioFile = await applyCutsToAudio(audioFile, data.keptRegions);
-            setAudioFile(trimmedAudioFile); // تحديث الملف الفيزيائي في الشاشة
-        } catch (slicerError) {
-            // هذا التنبيه سيكشف لنا السر إذا فشل المتصفح في القص!
-            alert(`🚨 Browser Slicer Error: ${slicerError.message}\n(Press F12 and check Console for details)`);
-            throw slicerError; // إيقاف العملية
+      if (data.timeSaved > 0 && data.keptRegions && data.keptRegions.length > 0) {
+        // +++ تحويل "المناطق المحفوظة" إلى "فراغات محذوفة" لكي نرسمها بالأحمر +++
+        let silences = [];
+        
+        // الفراغ قبل أول منطقة (إذا كان هناك سكوت في البداية)
+        if (data.keptRegions[0].start > 0) {
+            silences.push({ start: 0, end: data.keptRegions[0].start });
         }
-      }
+        // الفراغات بين المناطق
+        for (let i = 0; i < data.keptRegions.length - 1; i++) {
+            if (data.keptRegions[i+1].start > data.keptRegions[i].end) {
+                silences.push({ start: data.keptRegions[i].end, end: data.keptRegions[i+1].start });
+            }
+        }
 
-      pushToHistory({ transcriptionData: data.chunks });
-      if (data.chunks.length > 0) setDuration(data.chunks[data.chunks.length - 1].endTime);
-
-      if (data.timeSaved && data.timeSaved > 0) {
-        alert(`✨ Silence Trimming Complete!\nAI successfully shaved off ${data.timeSaved.toFixed(2)} seconds of dead air!`);
+        setSuggestedSilences(silences); // إرسالها للموجة لترسمها!
+        pushToHistory({ transcriptionData: data.chunks });
+        
+        alert(`🤖 AI Analysis Complete!\nFound ${silences.length} silence gaps.\nThey are highlighted in RED on the waveform. Review them and click 'Apply Manual Cuts' to slice the audio.`);
       } else {
-        alert(`ℹ️ AI Notice: ${data.message || "No significant silence found to trim."}`);
+        alert(`ℹ️ Notice: No significant silence detected.`);
       }
-
     } catch (error) {
-      console.error("❌ [Trim Error]:", error);
-      alert(`❌ Error processing silence trimmer: ${error.message}`);
+      alert(`❌ Process Failed: ${error.message}`);
     } finally {
       setIsProcessing(false);
       setProcessLog("");
     }
   };
+
+  // --- دالة التنفيذ الفيزيائي للقص (بعد موافقة المستخدم) ---
+  const handleManualCuts = async (keptRegions) => {
+    if (!audioFile) return;
+    setIsProcessing(true);
+    setProcessLog("✂️ Physically slicing and stitching the audio file... ⏳");
+    try {
+      const trimmedAudioFile = await applyCutsToAudio(audioFile, keptRegions);
+      setAudioFile(trimmedAudioFile); // وضع الملف الجديد في الواجهة
+      setSuggestedSilences([]); // مسح المربعات الحمراء
+      alert(`✨ Success! Audio has been successfully trimmed.\nNew file: ${trimmedAudioFile.name}`);
+    } catch (error) {
+      console.error(error);
+      alert(`🚨 Audio Engine Error: ${error.message}`);
+    } finally {
+      setIsProcessing(false);
+      setProcessLog("");
+    }
+  };
+
+
   
 // --- دالة توليد الصدى لمحرك التصدير ---
 const generateReverbImpulse = (ctx) => {
@@ -165,6 +179,9 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
   const [activeTranscriptId, setActiveTranscriptId] = useState(projectId || null);
   // 7. حالة محرك القص الذكي
   const [trimmerMode, setTrimmerMode] = useState("ai_speech");
+
+  // 8. حالة الفراغات المقترحة من الذكاء الاصطناعي للرسم
+  const [suggestedSilences, setSuggestedSilences] = useState([]);
   // 5. حالات الفلاتر الصوتية الحية (Live FX Engine)
   const [pitch, setPitch] = useState(1); 
   const [reverbAmount, setReverbAmount] = useState(0); 
@@ -342,21 +359,17 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
     setHistoryIndex(0);
   };
 
-// --- دالة تشغيل القص (مع أجهزة الاستشعار المنبثقة - Ultimate Debug) ---
- // --- دالة تشغيل القص (Professional English UI) ---
+// --- 1. دالة القص الذكي (هذه ترسم المربعات الحمراء فقط ولا تقطع) ---
   const handleSmartTrimSilence = async () => {
     if (!activeTranscriptId) return alert("⚠️ Please load or fetch an API Transcript first!");
     setIsProcessing(true);
-    setProcessLog(`✂️ Scanning timeline using [${trimmerMode === 'ai_speech' ? 'AI Speech' : 'Acoustic'}] mode...`);
+    setProcessLog(`✂️ Scanning timeline for dead air...`);
     
     try {
       const token = localStorage.getItem("token");
       const response = await fetch(`http://localhost:5000/api/trim-silence/${activeTranscriptId}`, {
         method: "POST",
-        headers: { 
-          "Authorization": `Bearer ${token}`,
-          "Content-Type": "application/json" 
-        },
+        headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ mode: trimmerMode })
       });
       
@@ -364,26 +377,46 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
       const data = await response.json();
 
       if (data.timeSaved > 0 && data.keptRegions && data.keptRegions.length > 0) {
-        setProcessLog("✂️ Physically slicing and stitching the audio file in browser... ⏳");
-        try {
-            const trimmedAudioFile = await applyCutsToAudio(audioFile, data.keptRegions);
-            setAudioFile(trimmedAudioFile);
-            
-            // رسالة النجاح الاحترافية بالإنجليزية
-            alert(`✨ Silence Trimming Complete!\nSuccessfully shaved off ${data.timeSaved.toFixed(2)} seconds of dead air.\nNew file: ${trimmedAudioFile.name}`);
-        } catch (slicerError) {
-            alert(`🚨 Audio Engine Error: Could not slice the physical file.\nDetails: ${slicerError.message}`);
-            throw slicerError;
+        let silences = [];
+        if (data.keptRegions[0].start > 0) silences.push({ start: 0, end: data.keptRegions[0].start });
+        for (let i = 0; i < data.keptRegions.length - 1; i++) {
+            if (data.keptRegions[i+1].start > data.keptRegions[i].end) {
+                silences.push({ start: data.keptRegions[i].end, end: data.keptRegions[i+1].start });
+            }
         }
+        setSuggestedSilences(silences); 
+        pushToHistory({ transcriptionData: data.chunks });
+        alert(`🤖 AI Analysis Complete!\nFound ${silences.length} silence gaps.\nThey are highlighted in RED on the waveform. Review them and click 'Apply Manual Cuts' to slice the audio.`);
       } else {
-        alert(`ℹ️ Notice: ${data.message || "No significant silence detected based on your current mode settings."}`);
+        alert(`ℹ️ Notice: No significant silence detected.`);
       }
-
-      pushToHistory({ transcriptionData: data.chunks });
-      if (data.chunks.length > 0) setDuration(data.chunks[data.chunks.length - 1].endTime);
-
     } catch (error) {
       alert(`❌ Process Failed: ${error.message}`);
+    } finally {
+      setIsProcessing(false);
+      setProcessLog("");
+    }
+  };
+
+// --- دالة التنفيذ الفيزيائي للقص (مع منع تجمد الشاشة) ---
+  const handleManualCuts = async (keptRegions) => {
+    if (!audioFile) return;
+    
+    // 1. تشغيل واجهة التحميل للمستخدم
+    setIsProcessing(true);
+    setProcessLog("✂️ Processing massive audio data... Please wait ⏳");
+
+    // 2. السحر: إجبار المتصفح على أخذ استراحة 100 ملي ثانية لكي يرسم واجهة التحميل قبل أن يتجمد المعالج!
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    try {
+      const trimmedAudioFile = await applyCutsToAudio(audioFile, keptRegions);
+      setAudioFile(trimmedAudioFile); // وضع الملف الجديد السلس
+      setSuggestedSilences([]); // مسح المربعات الحمراء بعد القص
+      alert(`✨ Success! Audio has been successfully trimmed.\nNew file: ${trimmedAudioFile.name}`);
+    } catch (error) {
+      console.error(error);
+      alert(`🚨 Audio Engine Error: ${error.message}`);
     } finally {
       setIsProcessing(false);
       setProcessLog("");
@@ -623,12 +656,11 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
               <div className="flex-1 flex flex-col items-center justify-center w-full max-w-5xl h-full">
                 {audioFile ? (
                   <StudioWaveform 
-                    key={audioFile.name + audioFile.size} // +++ هذا هو مفتاح السحر الذي يجبر الموجة على التحديث +++
                     file={audioFile} 
                     onClear={() => { 
                       setAudioFile(null); setCurrentTime(0); setDuration(0); setHistoryIndex(0); 
                       setHistory([{ isSplit: false, isEnhanced: false, transcriptionData: [] }]);
-                      setPitch(1); setReverbAmount(0);
+                      setPitch(1); setReverbAmount(0); setSuggestedSilences([]); 
                     }} 
                     onTimeUpdate={setCurrentTime}
                     onPlayStateChange={setIsPlaying}
@@ -637,6 +669,8 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
                     isEnhanced={isEnhanced}
                     pitch={pitch}
                     reverbAmount={reverbAmount}
+                    suggestedSilences={suggestedSilences} 
+                    onApplyManualCuts={handleManualCuts} 
                   />
                 ) : (
                   <div className="w-full max-w-2xl p-12 border-2 border-dashed border-gray-800 rounded-3xl flex flex-col items-center justify-center bg-gray-900/10 backdrop-blur-sm">

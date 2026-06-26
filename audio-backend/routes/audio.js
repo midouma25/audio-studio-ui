@@ -227,8 +227,8 @@ router.post('/trim-silence/:id', protect, async (req, res, next) => {
         }
 
         // إعدادات الشراسة
-        const maxAllowedSilence = mode === "ai_speech" ? 0.15 : 0.8; 
-        const padding = mode === "ai_speech" ? 0.05 : 0.2;
+        const maxAllowedSilence = mode === "ai_speech" ? 0.25 : 0.8; 
+        const padding = mode === "ai_speech" ? 0.15 : 0.3;
 
         // 1. صناعة خريطة مبدئية لأماكن الكلمات فقط (مع إضافة حواف الأمان)
         let rawRegions = originalChunks.map(c => ({
