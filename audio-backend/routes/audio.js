@@ -1,14 +1,16 @@
 // routes/audio.js
 import express from 'express';
 import multer from 'multer';
-import dotenv from 'dotenv'; // +++ 1. استيراد المكتبة هنا
+import dotenv from 'dotenv'; 
+import Transcript from '../models/Transcript.js';
+// +++ 1. استيراد حارس البوابة الأمنية
+import { protect } from '../middleware/authMiddleware.js';
 
-dotenv.config(); // +++ 2. تشغيلها فوراً قبل قراءة المفتاح
+dotenv.config(); 
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
-// +++ الآن سيتمكن من رؤية المفتاح بنجاح! +++
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY;
 
 const formatShortTime = (timeInSeconds) => {
@@ -36,8 +38,14 @@ const validateAIRequest = (req, res, next) => {
     next(); 
 };
 
-router.post('/transcribe', upload.single('audio_file'), validateAIRequest, async (req, res, next) => {
+// +++ 2. إضافة protect كحارس أول قبل رفع الملف +++
+router.post('/transcribe', protect, upload.single('audio_file'), validateAIRequest, async (req, res, next) => {
     try {
+        // +++ 3. فحص رصيد المستخدم قبل البدء بأي عملية مكلفة +++
+        if (req.user.credits <= 0 && !req.user.isPremium) {
+            return res.status(402).json({ error: "Payment Required: You have 0 credits left for today!" });
+        }
+
         const audioLanguage = req.body.language || "auto";
         const translateTo = req.body.translate_to || "none";
 
@@ -57,7 +65,6 @@ router.post('/transcribe', upload.single('audio_file'), validateAIRequest, async
         }
         const uploadData = await uploadResponse.json();
         const uploadUrl = uploadData.upload_url;
-
         console.log("🧠 [Server 2/4] Requesting Transcription...");
         const transcriptResponse = await fetch("https://api.assemblyai.com/v2/transcript", {
             method: "POST",
@@ -69,8 +76,9 @@ router.post('/transcribe', upload.single('audio_file'), validateAIRequest, async
                 audio_url: uploadUrl,
                 language_detection: audioLanguage === "auto",
                 language_code: audioLanguage !== "auto" ? audioLanguage : undefined,
+                speaker_labels: true, // +++ هذا هو السطر السحري لتفعيل التفرقة بين الأصوات +++
             }),
-        });
+        });        
         
         if (!transcriptResponse.ok) {
             const transcriptError = await transcriptResponse.json();
@@ -98,19 +106,27 @@ router.post('/transcribe', upload.single('audio_file'), validateAIRequest, async
             let currentChunk = [];
             for (let i = 0; i < finalResult.words.length; i++) {
                 currentChunk.push(finalResult.words[i]);
-                const isPause = finalResult.words[i+1] && (finalResult.words[i+1].start - finalResult.words[i].end > 400);
-                if (isPause || currentChunk.length >= 10 || i === finalResult.words.length - 1) {
+                
+                // +++ متى نقوم بقص الجملة؟ إذا كان هناك سكوت، أو طالت الجملة، أو "تغير المتحدث" +++
+                const nextWord = finalResult.words[i+1];
+                const isPause = nextWord && (nextWord.start - finalResult.words[i].end > 400);
+                const isSpeakerChanged = nextWord && (nextWord.speaker !== finalResult.words[i].speaker);
+                
+                if (isPause || isSpeakerChanged || currentChunk.length >= 12 || i === finalResult.words.length - 1) {
                     groupedChunks.push({
                         id: groupedChunks.length,
                         startTime: currentChunk[0].start / 1000,
                         endTime: currentChunk[currentChunk.length - 1].end / 1000,
                         text: currentChunk.map(w => w.text).join(audioLanguage === 'ja' ? "" : " "),
                         translatedText: null,
-                        timeString: formatShortTime(currentChunk[0].start / 1000)
+                        timeString: formatShortTime(currentChunk[0].start / 1000),
+                        speaker: currentChunk[0].speaker || "A" // +++ حفظ حرف المتحدث (A, B, C...) +++
                     });
                     currentChunk = [];
                 }
             }
+
+            // ... (بقية كود الترجمة translateTo كما هو بدون تغيير)
 
             if (translateTo !== "none") {
                 const detectedLang = finalResult.language_code || "ja";
@@ -125,12 +141,157 @@ router.post('/transcribe', upload.single('audio_file'), validateAIRequest, async
             }
         }
 
+        console.log("💾 [Server] Saving transcript to Database...");
+        
+        // إنشاء سجل جديد في قاعدة البيانات
+        const newTranscript = new Transcript({
+            fileName: req.file.originalname,
+            audioLanguage: audioLanguage,
+            translateTo: translateTo,
+            chunks: groupedChunks
+        });
+
+        // حفظ السجل فعلياً
+        const savedData = await newTranscript.save();
+        console.log(`✅ [Database] Saved successfully with ID: ${savedData._id}`);
+
+        // +++ 4. خصم 1 رصيد من حساب المستخدم وتحديث قاعدة البيانات +++
+        req.user.credits -= 1;
+        await req.user.save();
+        console.log(`🪙 [Credits] Deducted 1 credit from ${req.user.email}. Remaining: ${req.user.credits}`);
+
         console.log("✅ [Server] Processing complete! Sending data to Client.");
-        res.status(200).json({ chunks: groupedChunks });
+        
+        // أضفنا ID قاعدة البيانات والرصيد المتبقي للرد
+        res.status(200).json({ 
+            transcriptId: savedData._id,
+            chunks: groupedChunks,
+            remainingCredits: req.user.credits // +++ 5. إرسال الرصيد الجديد للواجهة الأمامية
+        });
 
     } catch (error) {
         next(error); 
     }
 });
 
+// ==========================================
+// 📂 مسار جلب قائمة كل الملفات السابقة (للوحة التحكم)
+// ==========================================
+router.get('/transcripts', async (req, res, next) => {
+    try {
+        console.log("📜 [Server] Fetching all transcript history...");
+        
+        // جلب البيانات من Mongoose
+        const history = await Transcript.find()
+            .select('-chunks') 
+            .sort({ createdAt: -1 });
+
+        console.log(`✅ [Database] Found ${history.length} saved transcripts.`);
+        res.status(200).json({ history });
+    } catch (error) {
+        next(error); 
+    }
+});
+
+
+router.get('/transcript/:id', async (req, res, next) => {
+    try {
+        const transcriptId = req.params.id;
+        console.log(`🔍 [Server] Fetching transcript with ID: ${transcriptId}`);
+        const transcript = await Transcript.findById(transcriptId);
+        if (!transcript) {
+            return res.status(404).json({ error: "Transcript not found" });
+        }
+        res.status(200).json({ chunks: transcript.chunks });
+    } catch (error) {
+        next(error); 
+    }
+});
+// routes/audio.js
+
+// ==========================================
+// ✂️ ميزة القص الذكي للفراغات (Smart Silence Trimmer)
+// ==========================================
+router.post('/trim-silence/:id', protect, async (req, res, next) => {
+    try {
+        const transcriptId = req.params.id;
+        const { mode } = req.body;
+        console.log(`✂️ [AI Tool] Trimming silence (Mode: ${mode}) for ID: ${transcriptId}`);
+
+        const transcript = await Transcript.findById(transcriptId);
+        if (!transcript) return res.status(404).json({ error: "Project not found" });
+
+        let originalChunks = transcript.chunks;
+        if (originalChunks.length <= 1) {
+            return res.status(200).json({ chunks: originalChunks, timeSaved: 0, keptRegions: [], message: "Audio too short." });
+        }
+
+        let trimmedChunks = [];
+        let timeOffset = 0; 
+        
+        // +++ تحديث الشراسة: عتبات أقل وقص أدق +++
+        // الخيار الصارم: يقص أي فراغ أكبر من 0.15 ثانية (بدلاً من 0.3)
+        // الخيار الطبيعي: يقص أي فراغ أكبر من 0.8 ثانية (بدلاً من 1.2)
+        const maxAllowedSilence = mode === "ai_speech" ? 0.15 : 0.8; 
+        
+        // حواف الأمان: 0.05 ثانية فقط للخيار الصارم لكي لا يترك هواءً زائداً
+        const padding = mode === "ai_speech" ? 0.05 : 0.2;
+
+        let keptRegions = [];
+        let currentKeepStart = 0;
+
+        trimmedChunks.push({ ...originalChunks[0].toObject(), id: 0 });
+
+        for (let i = 1; i < originalChunks.length; i++) {
+            const prevChunk = originalChunks[i - 1];
+            const currentChunk = originalChunks[i];
+            const silenceDuration = currentChunk.startTime - prevChunk.endTime;
+
+            if (silenceDuration > maxAllowedSilence) {
+                // حفظ المنطقة مع حافة أمان صغيرة جداً
+                keptRegions.push({ start: currentKeepStart, end: prevChunk.endTime + padding });
+                currentKeepStart = currentChunk.startTime - padding;
+                
+                // حساب الوقت المقطوع الحقيقي (بعد خصم حواف الأمان من الطرفين)
+                const amountToTrim = silenceDuration - (padding * 2);
+                timeOffset += amountToTrim; 
+            }
+
+            const newStartTime = currentChunk.startTime - timeOffset;
+            const newEndTime = currentChunk.endTime - timeOffset;
+
+            const mins = Math.floor(newStartTime / 60);
+            const secs = Math.floor(newStartTime % 60);
+            const newTimeString = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+
+            trimmedChunks.push({
+                id: trimmedChunks.length,
+                startTime: newStartTime,
+                endTime: newEndTime,
+                text: currentChunk.text,
+                translatedText: currentChunk.translatedText,
+                timeString: newTimeString,
+                speaker: currentChunk.speaker
+            });
+        }
+
+        keptRegions.push({ start: currentKeepStart, end: 999999 });
+
+        // إضافة آخر منطقة صالحة حتى نهاية الملف الصوتي
+        keptRegions.push({ start: currentKeepStart, end: 999999 });
+
+        transcript.chunks = trimmedChunks;
+        await transcript.save();
+
+        console.log(`✅ [AI Tool] Silence trimmed! Offset removed: ${timeOffset.toFixed(2)}s`);
+        res.status(200).json({ 
+            chunks: trimmedChunks, 
+            timeSaved: timeOffset,
+            keptRegions: keptRegions // +++ إرسال الخريطة للفرونت إند +++
+        });
+
+    } catch (error) {
+        next(error);
+    }
+});
 export default router;

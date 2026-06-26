@@ -2,11 +2,16 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-// استيراد راوتر الصوتيات المعياري الجديد
 import audioRouter from './routes/audio.js';
-
+// +++ 1. استيراد دالة الاتصال بقاعدة البيانات +++
+import connectDB from './config/db.js';
+import authRouter from './routes/auth.js';
+    
 // تحميل متغيرات البيئة السرية
 dotenv.config();
+
+// +++ 2. تشغيل الاتصال بقاعدة البيانات فوراً +++
+connectDB();
 
 const app = express();
 app.use(cors());
@@ -28,7 +33,7 @@ app.use(requestLogger);
 // ==========================================
 // نخبر إكسبريس أن أي طلب يبدأ بـ /api يجب توجيهه فوراً لملف audioRouter
 app.use('/api', audioRouter);
-
+app.use('/api/auth', authRouter);
 app.get('/', (req, res) => {
     res.status(200).json({ status: "Online", message: "Audio Master API Server is running! 🚀" });
 });
