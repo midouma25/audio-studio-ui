@@ -98,7 +98,7 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
   const [suggestedSilences, setSuggestedSilences] = useState([]);
   
   const [speed, setSpeed] = useState(1); 
-  const [pitch, setPitch] = useState(1); 
+  const [pitch, setPitch] = useState(0); 
   const [isDeEsser, setIsDeEsser] = useState(false);
   const [reverbAmount, setReverbAmount] = useState(0); 
 
@@ -130,11 +130,10 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
     }
   }, [projectId]);
 
-  // +++ تحديث التصدير للعمل مع الـ De-Esser الحقيقي +++
   const downloadAudio = async (prefix = "") => {
     if (!audioFile) return;
 
-    if (prefix === "AI_Mastered" && (isEnhanced || speed !== 1 || pitch !== 1 || reverbAmount > 0 || isDeEsser)) {
+    if (prefix === "AI_Mastered" && (isEnhanced || speed !== 1 || pitch !== 0 || reverbAmount > 0 || isDeEsser)) {
       setIsProcessing(true);
       setProcessLog("✨ Rendering Audio Matrix with all layers... Please wait.");
 
@@ -143,7 +142,10 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
         const arrayBuffer = await audioFile.arrayBuffer();
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
         
-        const totalRate = speed * pitch;
+        // حساب المضاعف السحري للسرعة والنبرة!
+        const pitchMultiplier = Math.pow(2, pitch / 12);
+        const totalRate = speed * pitchMultiplier;
+
         const newDuration = audioBuffer.duration * (1 / totalRate);
         const offlineCtx = new OfflineAudioContext(audioBuffer.numberOfChannels, audioCtx.sampleRate * newDuration, audioCtx.sampleRate);
 
@@ -153,19 +155,15 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
 
         let currentNode = source;
 
-        // تطبيق الـ De-Esser الحقيقي للريندر
         if (isDeEsser) {
           const dLow = offlineCtx.createBiquadFilter(); dLow.type = "lowpass"; dLow.frequency.value = 5500;
           const dHigh = offlineCtx.createBiquadFilter(); dHigh.type = "highpass"; dHigh.frequency.value = 5500;
-          
           const dComp = offlineCtx.createDynamicsCompressor();
-          dComp.threshold.value = -35; dComp.knee.value = 5; dComp.ratio.value = 15; dComp.attack.value = 0.002; dComp.release.value = 0.05;
-          
+          dComp.threshold.value = -35; dComp.knee.value = 5; dComp.ratio.value = 20; dComp.attack.value = 0.002; dComp.release.value = 0.05;
           const dMerge = offlineCtx.createGain();
 
           currentNode.connect(dLow); dLow.connect(dMerge);
           currentNode.connect(dHigh); dHigh.connect(dComp); dComp.connect(dMerge);
-
           currentNode = dMerge;
         }
 
@@ -218,7 +216,7 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
   };
 
   useEffect(() => {
-    if (workflowMode === "instant" && audioFile && (isEnhanced || speed !== 1 || pitch !== 1 || reverbAmount > 0 || isDeEsser)) {
+    if (workflowMode === "instant" && audioFile && (isEnhanced || speed !== 1 || pitch !== 0 || reverbAmount > 0 || isDeEsser)) {
       const autoSaveTimer = setTimeout(() => {
         downloadAudio("AI_Mastered");
       }, 1200);
@@ -416,7 +414,7 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
           {audioFile && (
             <div className="flex items-center gap-2 mr-4 border-r border-gray-800 pr-4">
               <button onClick={() => downloadAudio()} className="px-3 py-1.5 bg-gray-900 hover:bg-gray-800 border border-gray-700 text-gray-300 text-xs rounded transition-colors">📥 Original</button>
-              {workflowMode === "multi" && (isEnhanced || speed !== 1 || pitch !== 1 || reverbAmount > 0 || isDeEsser) && (
+              {workflowMode === "multi" && (isEnhanced || speed !== 1 || pitch !== 0 || reverbAmount > 0 || isDeEsser) && (
                 <button onClick={() => downloadAudio("AI_Mastered")} className="px-3 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-400 font-bold text-xs rounded transition-colors shadow-lg">✨ Export Master track</button>
               )}
             </div>
@@ -495,17 +493,16 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
               <p className="text-[9px] text-gray-500">Multi-band High Frequency Compression</p>
             </div>
 
-            {/* +++ مؤشر الـ Pitch المتقدم للتحكم المريح +++ */}
-            <div className={`p-3 rounded-lg border transition-all ${pitch !== 1 ? 'bg-purple-900/10 border-purple-500/30' : 'bg-[#0a0a0a] border-gray-800'}`}>
+            <div className={`p-3 rounded-lg border transition-all ${pitch !== 0 ? 'bg-purple-900/10 border-purple-500/30' : 'bg-[#0a0a0a] border-gray-800'}`}>
               <div className="flex justify-between items-center mb-3">
-                <span className={`text-xs font-bold ${pitch !== 1 ? 'text-purple-400' : 'text-gray-400'}`}>🎭 Voice Morph (Pitch)</span>
-                <span className="text-xs font-mono bg-black px-1.5 rounded text-gray-400">{pitch.toFixed(2)}x</span>
+                <span className={`text-xs font-bold ${pitch !== 0 ? 'text-purple-400' : 'text-gray-400'}`}>🎭 Voice Morph (Pitch)</span>
+                <span className="text-xs font-mono bg-black px-1.5 rounded text-gray-400">{pitch > 0 ? `+${pitch}` : pitch} st</span>
               </div>
-              <input type="range" min="0.5" max="2" step="0.05" value={pitch} onChange={(e) => setPitch(parseFloat(e.target.value))} className="w-full h-1 bg-gray-800 rounded-lg appearance-none cursor-pointer accent-purple-500" />
+              <input type="range" min="-12" max="12" step="1" value={pitch} onChange={(e) => setPitch(parseInt(e.target.value))} className="w-full h-1 bg-gray-800 rounded-lg appearance-none cursor-pointer accent-purple-500" />
               <div className="flex justify-between text-[8px] text-gray-500 font-mono mt-1">
-                <button onClick={() => setPitch(0.7)} className="hover:text-purple-400">Deep</button>
-                <button onClick={() => setPitch(1)} className="hover:text-gray-300">Normal</button>
-                <button onClick={() => setPitch(1.3)} className="hover:text-purple-400">Thin</button>
+                <button onClick={() => setPitch(-4)} className="hover:text-purple-400">Deep</button>
+                <button onClick={() => setPitch(0)} className="hover:text-gray-300">Normal</button>
+                <button onClick={() => setPitch(4)} className="hover:text-purple-400">Thin</button>
               </div>
             </div>
 
@@ -544,7 +541,7 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
                     onClear={() => { 
                       setAudioFile(null); setCurrentTime(0); setDuration(0); setHistoryIndex(0); 
                       setHistory([{ isSplit: false, isEnhanced: false, transcriptionData: [] }]);
-                      setSpeed(1); setPitch(1); setIsDeEsser(false); setReverbAmount(0); setSuggestedSilences([]); 
+                      setSpeed(1); setPitch(0); setIsDeEsser(false); setReverbAmount(0); setSuggestedSilences([]); 
                     }} 
                     onTimeUpdate={setCurrentTime}
                     onPlayStateChange={setIsPlaying}

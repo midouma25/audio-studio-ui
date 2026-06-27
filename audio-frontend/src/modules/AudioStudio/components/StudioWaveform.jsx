@@ -18,7 +18,7 @@ const generateReverbImpulse = (ctx) => {
 
 export default function StudioWaveform({ 
   file, onClear, onTimeUpdate, onPlayStateChange, onDurationChange, seekToTime, 
-  isEnhanced, speed = 1, pitch = 1, isDeEsser = false, reverbAmount = 0,
+  isEnhanced, speed = 1, pitch = 0, isDeEsser = false, reverbAmount = 0,
   onApplyManualCuts, suggestedSilences = [], isProcessing = false, processLog = "", onReady 
 }) {
   const waveformRef = useRef(null);
@@ -32,7 +32,7 @@ export default function StudioWaveform({
   const dryGainRef = useRef(null);
   const wetGainRef = useRef(null);
   
-  // +++ عقد الـ De-Esser الاحترافي (Multiband) +++
+  // عُقد De-Esser الاحترافية (Multiband Compressor)
   const deEsserLowRef = useRef(null);
   const deEsserHighRef = useRef(null);
   const deEsserCompRef = useRef(null);
@@ -106,32 +106,19 @@ export default function StudioWaveform({
     sourceNodeRef.current = source;
 
     // ==========================================
-    // 🎛️ بناء فلتر الـ De-Esser الحقيقي (Multiband)
+    // 🎛️ De-Esser حقيقي (ضاغط ديناميكي متعدد الموجات)
     // ==========================================
-    // 1. مسار الترددات المنخفضة (يمر بسلام)
-    const dLow = ctx.createBiquadFilter();
-    dLow.type = "lowpass"; dLow.frequency.value = 5500;
+    const dLow = ctx.createBiquadFilter(); dLow.type = "lowpass"; dLow.frequency.value = 5500;
+    const dHigh = ctx.createBiquadFilter(); dHigh.type = "highpass"; dHigh.frequency.value = 5500;
     
-    // 2. مسار الترددات العالية (التي فيها حرف السين)
-    const dHigh = ctx.createBiquadFilter();
-    dHigh.type = "highpass"; dHigh.frequency.value = 5500;
-    
-    // 3. ضاغط ديناميكي يراقب مسار الترددات العالية ويخنقها فقط عندما تتجاوز الحد!
     const dComp = ctx.createDynamicsCompressor();
-    dComp.threshold.value = -35; // حساس جداً
-    dComp.knee.value = 5;
-    dComp.ratio.value = 15; // خنق عنيف
-    dComp.attack.value = 0.002; // سرعة برق
-    dComp.release.value = 0.05;
-
-    // 4. عقدة تجميع المسارين
+    dComp.threshold.value = -35; dComp.knee.value = 5; dComp.ratio.value = 20; 
+    dComp.attack.value = 0.002; dComp.release.value = 0.05;
+    
     const dMerge = ctx.createGain();
 
-    deEsserLowRef.current = dLow;
-    deEsserHighRef.current = dHigh;
-    deEsserCompRef.current = dComp;
-    deEsserMergeRef.current = dMerge;
-
+    deEsserLowRef.current = dLow; deEsserHighRef.current = dHigh;
+    deEsserCompRef.current = dComp; deEsserMergeRef.current = dMerge;
     // ==========================================
 
     const compressor = ctx.createDynamicsCompressor();
@@ -161,17 +148,18 @@ export default function StudioWaveform({
     if (!audioCtxRef.current || !sourceNodeRef.current) return;
     const ctx = audioCtxRef.current;
     
-    sourceNodeRef.current.disconnect();
-    if(deEsserLowRef.current) deEsserLowRef.current.disconnect();
-    if(deEsserHighRef.current) deEsserHighRef.current.disconnect();
-    if(deEsserCompRef.current) deEsserCompRef.current.disconnect();
-    if(deEsserMergeRef.current) deEsserMergeRef.current.disconnect();
-    if(effectChainRef.current?.out) effectChainRef.current.out.disconnect();
-    if(reverbNodeRef.current) reverbNodeRef.current.disconnect();
+    // قطع الاتصالات بأمان لتجنب الشاشة السوداء!
+    try { sourceNodeRef.current.disconnect(); } catch(e){}
+    try { deEsserLowRef.current.disconnect(); } catch(e){}
+    try { deEsserHighRef.current.disconnect(); } catch(e){}
+    try { deEsserCompRef.current.disconnect(); } catch(e){}
+    try { deEsserMergeRef.current.disconnect(); } catch(e){}
+    try { if(effectChainRef.current?.out) effectChainRef.current.out.disconnect(); } catch(e){}
+    try { reverbNodeRef.current.disconnect(); } catch(e){}
 
     let currentNode = sourceNodeRef.current;
 
-    // +++ التوجيه للـ De-Esser الحقيقي +++
+    // تشغيل الـ De-Esser الاحترافي
     if (isDeEsser) {
         currentNode.connect(deEsserLowRef.current);
         currentNode.connect(deEsserHighRef.current);
@@ -198,16 +186,21 @@ export default function StudioWaveform({
 
   useEffect(() => { applyRouting(); }, [isEnhanced, isDeEsser]);
 
-  // +++ السحر هنا: تطبيق الـ Pitch (تخشين/ترقيق) مع السرعة بدقة +++
+  // +++ السحر هنا: التحكم بالـ Pitch الكلاسيكي (تخشين/ترقيق) بشكل منفصل عن السرعة +++
   useEffect(() => {
     if (wsRef.current) {
       const mediaEl = wsRef.current.getMediaElement();
+      // تحويل الدرجات (-12 إلى 12) إلى نسبة رياضية دقيقة
+      const pitchMultiplier = Math.pow(2, pitch / 12);
+      
       if (mediaEl) {
-        // نلغي الحفاظ على النبرة الطبيعية إذا كان الـ pitch متغيراً
-        mediaEl.preservesPitch = (pitch === 1);
-        mediaEl.webkitPreservesPitch = (pitch === 1); 
+        // إذا كان pitch يساوي 0 (طبيعي)، المتصفح يحافظ على النبرة أثناء تغيير السرعة العادية.
+        // وإلا، المتصفح يسمح للسرعة بتغيير النبرة (تأثير السنجاب والوحش)!
+        mediaEl.preservesPitch = (pitch === 0);
+        mediaEl.webkitPreservesPitch = (pitch === 0); 
       }
-      wsRef.current.setPlaybackRate(speed * pitch);
+      
+      wsRef.current.setPlaybackRate(speed * pitchMultiplier);
     }
 
     if (wetGainRef.current && dryGainRef.current) {
@@ -266,19 +259,19 @@ export default function StudioWaveform({
         </div>
       )}
 
-      {(isEnhanced || reverbAmount > 0 || speed !== 1 || pitch !== 1 || isDeEsser) && (
+      {(isEnhanced || reverbAmount > 0 || speed !== 1 || pitch !== 0 || isDeEsser) && (
          <div className="absolute inset-0 bg-emerald-500/5 pointer-events-none animate-pulse"></div>
       )}
       
       <div className="flex justify-between items-start mb-6">
         <div className="flex items-center gap-3 relative z-10">
-           <div className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${(isEnhanced || speed !== 1 || pitch !== 1) ? 'bg-emerald-500/20 text-emerald-400' : 'bg-gray-800 text-gray-400'}`}>🎙️</div>
+           <div className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${(isEnhanced || speed !== 1 || pitch !== 0) ? 'bg-emerald-500/20 text-emerald-400' : 'bg-gray-800 text-gray-400'}`}>🎙️</div>
            <div>
              <h3 className="text-gray-200 font-bold text-sm max-w-[200px] truncate">{file?.name || "Audio Track"}</h3>
              <div className="flex flex-wrap items-center gap-2 text-[10px] font-mono text-gray-500 mt-1">
                {isEnhanced && <span className="text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">✨ Enhanced</span>}
                {isDeEsser && <span className="text-blue-400 bg-blue-500/10 px-2 py-0.5 rounded border border-blue-500/20">🤫 De-Esser</span>}
-               {pitch !== 1 && <span className="text-purple-400 bg-purple-500/10 px-2 py-0.5 rounded border border-purple-500/20">🎭 Pitch {pitch}x</span>}
+               {pitch !== 0 && <span className="text-purple-400 bg-purple-500/10 px-2 py-0.5 rounded border border-purple-500/20">🎭 Pitch {pitch > 0 ? `+${pitch}` : pitch} st</span>}
                {speed !== 1 && <span className="text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20">⏱️ Speed {speed}x</span>}
              </div>
            </div>
