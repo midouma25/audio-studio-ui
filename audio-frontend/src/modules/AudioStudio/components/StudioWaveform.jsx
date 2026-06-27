@@ -17,17 +17,9 @@ const generateReverbImpulse = (ctx) => {
 };
 
 export default function StudioWaveform({ 
-  file, 
-  onClear, 
-  onTimeUpdate, 
-  onPlayStateChange, 
-  onDurationChange, 
-  seekToTime, 
-  isEnhanced, 
-  pitch = 1, 
-  reverbAmount = 0,
-  onApplyManualCuts,
-  suggestedSilences = [] 
+  file, onClear, onTimeUpdate, onPlayStateChange, onDurationChange, seekToTime, 
+  isEnhanced, speed = 1, pitch = 1, isDeEsser = false, reverbAmount = 0,
+  onApplyManualCuts, suggestedSilences = [], isProcessing = false, processLog = "", onReady 
 }) {
   const waveformRef = useRef(null);
   const wsRef = useRef(null);
@@ -39,63 +31,50 @@ export default function StudioWaveform({
   const reverbNodeRef = useRef(null);
   const dryGainRef = useRef(null);
   const wetGainRef = useRef(null);
+  
+  // +++ عقد الـ De-Esser الاحترافي (Multiband) +++
+  const deEsserLowRef = useRef(null);
+  const deEsserHighRef = useRef(null);
+  const deEsserCompRef = useRef(null);
+  const deEsserMergeRef = useRef(null);
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
 
-  // 1. تأسيس الموجة مرة واحدة فقط (يمنع انهيار AbortError واختفاء الشاشة)
+  const onReadyRef = useRef(onReady);
+  useEffect(() => { onReadyRef.current = onReady; }, [onReady]);
+
   useEffect(() => {
     if (!waveformRef.current) return;
 
     const ws = WaveSurfer.create({
-      container: waveformRef.current,
-      waveColor: '#374151', 
-      progressColor: '#10b981', 
-      cursorColor: '#ffffff',
-      barWidth: 2,
-      barGap: 2,
-      barRadius: 2,
-      height: 120,
-      normalize: true,
+      container: waveformRef.current, waveColor: '#374151', progressColor: '#10b981', 
+      cursorColor: '#ffffff', barWidth: 2, barGap: 2, barRadius: 2, height: 120, normalize: true,
     });
-
     const wsRegions = ws.registerPlugin(RegionsPlugin.create());
     wsRegions.enableDragSelection({ color: 'rgba(239, 68, 68, 0.3)' });
 
-    wsRef.current = ws;
-    wsRegionsRef.current = wsRegions;
+    wsRef.current = ws; wsRegionsRef.current = wsRegions;
 
     ws.on('ready', () => {
-      setDuration(ws.getDuration());
-      onDurationChange(ws.getDuration());
+      setDuration(ws.getDuration()); onDurationChange(ws.getDuration());
       setupWebAudio(ws.getMediaElement()); 
+      if (onReadyRef.current) onReadyRef.current(); 
     });
 
-    ws.on('audioprocess', (time) => {
-      setCurrentTime(time);
-      onTimeUpdate(time);
-    });
-
+    ws.on('audioprocess', (time) => { setCurrentTime(time); onTimeUpdate(time); });
     ws.on('play', () => { setIsPlaying(true); onPlayStateChange(true); });
     ws.on('pause', () => { setIsPlaying(false); onPlayStateChange(false); });
     ws.on('finish', () => { setIsPlaying(false); onPlayStateChange(false); });
-
-    wsRegions.on('region-clicked', (region, e) => {
-      e.stopPropagation();
-      region.remove();
-    });
+    wsRegions.on('region-clicked', (region, e) => { e.stopPropagation(); region.remove(); });
 
     return () => {
-      try { ws.destroy(); } catch(e) { /* تجاهل خطأ التدمير الآمن */ }
-      if (audioCtxRef.current) {
-         audioCtxRef.current.close();
-         audioCtxRef.current = null;
-      }
+      try { ws.destroy(); } catch(e) { }
+      if (audioCtxRef.current) { audioCtxRef.current.close(); audioCtxRef.current = null; }
     };
-  }, []); // [] مصفوفة فارغة تعني: لا تدمر الشاشة أبداً!
+  }, []);
 
-  // 2. تحديث الملف الصوتي بسلاسة بدون إعادة بناء الشاشة
   useEffect(() => {
     if (file && wsRef.current) {
       const url = URL.createObjectURL(file);
@@ -105,27 +84,20 @@ export default function StudioWaveform({
     }
   }, [file]);
 
-  // 3. رسم المربعات الحمراء (اقتراحات الذكاء الاصطناعي)
   useEffect(() => {
     if (!wsRegionsRef.current || suggestedSilences.length === 0) return;
     wsRegionsRef.current.clearRegions();
     suggestedSilences.forEach(silence => {
       if (silence.end > silence.start) {
          wsRegionsRef.current.addRegion({
-           start: silence.start,
-           end: silence.end,
-           color: 'rgba(239, 68, 68, 0.3)',
-           drag: true,
-           resize: true
+           start: silence.start, end: silence.end, color: 'rgba(239, 68, 68, 0.3)', drag: true, resize: true
          });
       }
     });
   }, [suggestedSilences]);
 
-  // 4. بناء هندسة الاستوديو 
   const setupWebAudio = (mediaElement) => {
     if (audioCtxRef.current) return; 
-
     const AudioContext = window.AudioContext || window.webkitAudioContext;
     const ctx = new AudioContext();
     audioCtxRef.current = ctx;
@@ -133,37 +105,54 @@ export default function StudioWaveform({
     const source = ctx.createMediaElementSource(mediaElement);
     sourceNodeRef.current = source;
 
-    const compressor = ctx.createDynamicsCompressor();
-    compressor.threshold.value = -24;
-    compressor.ratio.value = 12;
-    const eq = ctx.createBiquadFilter();
-    eq.type = "highshelf";
-    eq.frequency.value = 3000;
-    eq.gain.value = 6;
-    const gain = ctx.createGain();
-    gain.gain.value = 1.5;
+    // ==========================================
+    // 🎛️ بناء فلتر الـ De-Esser الحقيقي (Multiband)
+    // ==========================================
+    // 1. مسار الترددات المنخفضة (يمر بسلام)
+    const dLow = ctx.createBiquadFilter();
+    dLow.type = "lowpass"; dLow.frequency.value = 5500;
+    
+    // 2. مسار الترددات العالية (التي فيها حرف السين)
+    const dHigh = ctx.createBiquadFilter();
+    dHigh.type = "highpass"; dHigh.frequency.value = 5500;
+    
+    // 3. ضاغط ديناميكي يراقب مسار الترددات العالية ويخنقها فقط عندما تتجاوز الحد!
+    const dComp = ctx.createDynamicsCompressor();
+    dComp.threshold.value = -35; // حساس جداً
+    dComp.knee.value = 5;
+    dComp.ratio.value = 15; // خنق عنيف
+    dComp.attack.value = 0.002; // سرعة برق
+    dComp.release.value = 0.05;
 
-    compressor.connect(eq);
-    eq.connect(gain);
+    // 4. عقدة تجميع المسارين
+    const dMerge = ctx.createGain();
+
+    deEsserLowRef.current = dLow;
+    deEsserHighRef.current = dHigh;
+    deEsserCompRef.current = dComp;
+    deEsserMergeRef.current = dMerge;
+
+    // ==========================================
+
+    const compressor = ctx.createDynamicsCompressor();
+    compressor.threshold.value = -24; compressor.ratio.value = 12;
+    const eq = ctx.createBiquadFilter();
+    eq.type = "highshelf"; eq.frequency.value = 3000; eq.gain.value = 6;
+    const gain = ctx.createGain(); gain.gain.value = 1.5;
+
+    compressor.connect(eq); eq.connect(gain);
     effectChainRef.current = { in: compressor, out: gain };
 
     const convolver = ctx.createConvolver();
     convolver.buffer = generateReverbImpulse(ctx);
     reverbNodeRef.current = convolver;
 
-    const dryGain = ctx.createGain(); 
-    const wetGain = ctx.createGain(); 
-
-    // +++ إصلاح الخلل الخطير: ضبط الصدى على الصفر عند التحميل +++
+    const dryGain = ctx.createGain(); const wetGain = ctx.createGain(); 
     const wetRatio = reverbAmount / 100;
-    wetGain.gain.value = wetRatio * 1.5;
-    dryGain.gain.value = 1 - (wetRatio * 0.3);
+    wetGain.gain.value = wetRatio * 1.5; dryGain.gain.value = 1 - (wetRatio * 0.3);
 
-    dryGainRef.current = dryGain;
-    wetGainRef.current = wetGain;
-
-    wetGain.connect(ctx.destination);
-    dryGain.connect(ctx.destination);
+    dryGainRef.current = dryGain; wetGainRef.current = wetGain;
+    wetGain.connect(ctx.destination); dryGain.connect(ctx.destination);
 
     applyRouting();
   };
@@ -171,36 +160,62 @@ export default function StudioWaveform({
   const applyRouting = () => {
     if (!audioCtxRef.current || !sourceNodeRef.current) return;
     const ctx = audioCtxRef.current;
-    const source = sourceNodeRef.current;
-    const { in: fxIn, out: fxOut } = effectChainRef.current;
-    const convolver = reverbNodeRef.current;
-    const dryGain = dryGainRef.current;
-    const wetGain = wetGainRef.current;
+    
+    sourceNodeRef.current.disconnect();
+    if(deEsserLowRef.current) deEsserLowRef.current.disconnect();
+    if(deEsserHighRef.current) deEsserHighRef.current.disconnect();
+    if(deEsserCompRef.current) deEsserCompRef.current.disconnect();
+    if(deEsserMergeRef.current) deEsserMergeRef.current.disconnect();
+    if(effectChainRef.current?.out) effectChainRef.current.out.disconnect();
+    if(reverbNodeRef.current) reverbNodeRef.current.disconnect();
 
-    source.disconnect();
-    fxOut.disconnect();
-    convolver.disconnect();
+    let currentNode = sourceNodeRef.current;
 
-    const activeSource = isEnhanced ? fxOut : source;
-    if (isEnhanced) source.connect(fxIn);
+    // +++ التوجيه للـ De-Esser الحقيقي +++
+    if (isDeEsser) {
+        currentNode.connect(deEsserLowRef.current);
+        currentNode.connect(deEsserHighRef.current);
+        
+        deEsserLowRef.current.connect(deEsserMergeRef.current);
+        
+        deEsserHighRef.current.connect(deEsserCompRef.current);
+        deEsserCompRef.current.connect(deEsserMergeRef.current);
+        
+        currentNode = deEsserMergeRef.current;
+    }
 
-    activeSource.connect(dryGain);
-    activeSource.connect(convolver);
-    convolver.connect(wetGain);
+    if (isEnhanced) {
+        currentNode.connect(effectChainRef.current.in);
+        currentNode = effectChainRef.current.out;
+    }
+
+    currentNode.connect(dryGainRef.current);
+    currentNode.connect(reverbNodeRef.current);
+    reverbNodeRef.current.connect(wetGainRef.current);
 
     if (ctx.state === 'suspended') ctx.resume();
   };
 
-  useEffect(() => { applyRouting(); }, [isEnhanced]);
+  useEffect(() => { applyRouting(); }, [isEnhanced, isDeEsser]);
 
+  // +++ السحر هنا: تطبيق الـ Pitch (تخشين/ترقيق) مع السرعة بدقة +++
   useEffect(() => {
-    if (wsRef.current) wsRef.current.setPlaybackRate(pitch);
+    if (wsRef.current) {
+      const mediaEl = wsRef.current.getMediaElement();
+      if (mediaEl) {
+        // نلغي الحفاظ على النبرة الطبيعية إذا كان الـ pitch متغيراً
+        mediaEl.preservesPitch = (pitch === 1);
+        mediaEl.webkitPreservesPitch = (pitch === 1); 
+      }
+      wsRef.current.setPlaybackRate(speed * pitch);
+    }
+
     if (wetGainRef.current && dryGainRef.current) {
       const wetRatio = reverbAmount / 100;
       wetGainRef.current.gain.value = wetRatio * 1.5; 
       dryGainRef.current.gain.value = 1 - (wetRatio * 0.3); 
     }
-  }, [pitch, reverbAmount]);
+  }, [speed, pitch, reverbAmount]);
 
   useEffect(() => {
     if (seekToTime !== null && wsRef.current) wsRef.current.setTime(seekToTime);
@@ -238,26 +253,40 @@ export default function StudioWaveform({
 
   return (
     <div className="w-full max-w-4xl bg-[#080808] border border-gray-800 rounded-3xl p-6 shadow-2xl relative overflow-hidden transition-all duration-500">
-      {(isEnhanced || reverbAmount > 0 || pitch !== 1) && (
+      
+      {isProcessing && (
+        <div className="absolute inset-0 z-50 bg-black/90 backdrop-blur-md flex flex-col items-center justify-center rounded-3xl transition-opacity duration-300">
+            <div className="w-16 h-16 border-4 border-emerald-500 border-t-transparent rounded-full animate-spin mb-4 shadow-[0_0_20px_rgba(16,185,129,0.5)]"></div>
+            <h2 className="text-emerald-400 font-bold text-xl tracking-widest animate-pulse">{processLog || "⚙️ PROCESSING..."}</h2>
+            <div className="mt-4 flex gap-1">
+              <span className="w-2 h-2 bg-emerald-500 rounded-full animate-bounce"></span>
+              <span className="w-2 h-2 bg-emerald-500 rounded-full animate-bounce" style={{animationDelay: "0.1s"}}></span>
+              <span className="w-2 h-2 bg-emerald-500 rounded-full animate-bounce" style={{animationDelay: "0.2s"}}></span>
+            </div>
+        </div>
+      )}
+
+      {(isEnhanced || reverbAmount > 0 || speed !== 1 || pitch !== 1 || isDeEsser) && (
          <div className="absolute inset-0 bg-emerald-500/5 pointer-events-none animate-pulse"></div>
       )}
       
       <div className="flex justify-between items-start mb-6">
         <div className="flex items-center gap-3 relative z-10">
-           <div className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${(isEnhanced || pitch !== 1) ? 'bg-emerald-500/20 text-emerald-400' : 'bg-gray-800 text-gray-400'}`}>🎙️</div>
+           <div className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${(isEnhanced || speed !== 1 || pitch !== 1) ? 'bg-emerald-500/20 text-emerald-400' : 'bg-gray-800 text-gray-400'}`}>🎙️</div>
            <div>
              <h3 className="text-gray-200 font-bold text-sm max-w-[200px] truncate">{file?.name || "Audio Track"}</h3>
              <div className="flex flex-wrap items-center gap-2 text-[10px] font-mono text-gray-500 mt-1">
                {isEnhanced && <span className="text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">✨ Enhanced</span>}
-               {reverbAmount > 0 && <span className="text-cyan-400 bg-cyan-500/10 px-2 py-0.5 rounded border border-cyan-500/20">🏛️ Reverb {reverbAmount}%</span>}
+               {isDeEsser && <span className="text-blue-400 bg-blue-500/10 px-2 py-0.5 rounded border border-blue-500/20">🤫 De-Esser</span>}
                {pitch !== 1 && <span className="text-purple-400 bg-purple-500/10 px-2 py-0.5 rounded border border-purple-500/20">🎭 Pitch {pitch}x</span>}
+               {speed !== 1 && <span className="text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20">⏱️ Speed {speed}x</span>}
              </div>
            </div>
         </div>
 
         <div className="flex items-center gap-3 z-10">
             <div className="text-[9px] text-red-400/70 text-right leading-tight mr-2 hidden sm:block">Drag on waveform to select silence.<br/>Click a red box to delete it.</div>
-            <button onClick={handleApplyManualCuts} className="px-4 py-2 bg-red-600/20 hover:bg-red-600/40 border border-red-500/50 text-red-400 text-xs font-bold rounded-lg transition-colors shadow-lg">✂️ Apply Manual Cuts</button>
+            <button onClick={handleApplyManualCuts} className="px-4 py-2 bg-red-600/20 hover:bg-red-600/40 border border-red-500/50 text-red-400 text-xs font-bold rounded-lg transition-colors shadow-lg">✂️ Execute Cuts</button>
             <button onClick={onClear} className="text-gray-500 hover:text-red-400 transition-colors text-2xl ml-2">×</button>
         </div>
       </div>
@@ -267,7 +296,7 @@ export default function StudioWaveform({
       </div>
 
       <div className="flex items-center gap-4 relative z-10">
-        <button onClick={togglePlay} className={`w-14 h-14 shrink-0 rounded-full flex items-center justify-center text-xl transition-all duration-300 hover:scale-105 active:scale-95 ${(isEnhanced || pitch !== 1 || reverbAmount > 0) ? 'bg-gradient-to-br from-emerald-400 to-emerald-600 text-black shadow-[0_0_20px_rgba(16,185,129,0.4)]' : 'bg-white text-black'}`}>
+        <button onClick={togglePlay} className={`w-14 h-14 shrink-0 rounded-full flex items-center justify-center text-xl transition-all duration-300 hover:scale-105 active:scale-95 ${(isEnhanced || speed !== 1 || reverbAmount > 0) ? 'bg-gradient-to-br from-emerald-400 to-emerald-600 text-black shadow-[0_0_20px_rgba(16,185,129,0.4)]' : 'bg-white text-black'}`}>
           {isPlaying ? '⏸' : '▶'}
         </button>
         <div className="flex-1 flex flex-col justify-center">

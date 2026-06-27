@@ -3,7 +3,6 @@ import SmartDropzone from "./components/SmartDropzone";
 import StudioWaveform from "./components/StudioWaveform";
 import Transcript from "./components/Transcript";
 
-// --- دالة تحويل الصوت إلى WAV المادية عند التصدير ---
 function bufferToWave(abuffer, len) {
   let numOfChan = abuffer.numberOfChannels, length = len * numOfChan * 2 + 44,
       buffer = new ArrayBuffer(length), view = new DataView(buffer),
@@ -25,121 +24,43 @@ function bufferToWave(abuffer, len) {
   }
   return new Blob([buffer], {type: "audio/wav"});
 }
-// --- دالة تقطيع الصوت الفيزيائي (Web Audio Slicer - V2) ---
-// --- دالة تقطيع الصوت الفيزيائي (Web Audio Slicer - V3 Robust) ---
-  const applyCutsToAudio = async (file, keptRegions) => {
-    try {
-      console.log("🛠️ [Slicer] Starting...", keptRegions);
-      
-      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      const arrayBuffer = await file.arrayBuffer();
-      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
 
-      let newDuration = 0;
-      // تنظيف الأرقام لتجنب أي انهيار في محرك الصوت
-      const validRegions = keptRegions.map(region => {
-        const start = Math.max(0, Math.min(region.start, audioBuffer.duration));
-        const end = Math.max(0, Math.min(region.end, audioBuffer.duration));
-        newDuration += (end - start);
-        return { start, end, duration: end - start };
-      }).filter(r => r.duration > 0.01); // تجاهل القطع متناهية الصغر
+const applyCutsToAudio = async (file, keptRegions) => {
+  try {
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const arrayBuffer = await file.arrayBuffer();
+    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
 
-      if (newDuration <= 0) throw new Error("Trimmed duration is 0");
+    let newDuration = 0;
+    const validRegions = keptRegions.map(region => {
+      const start = Math.max(0, Math.min(region.start, audioBuffer.duration));
+      const end = Math.max(0, Math.min(region.end, audioBuffer.duration));
+      newDuration += (end - start);
+      return { start, end, duration: end - start };
+    }).filter(r => r.duration > 0.01); 
 
-      const totalFrames = Math.max(1, Math.ceil(audioCtx.sampleRate * newDuration));
-      const offlineCtx = new OfflineAudioContext(audioBuffer.numberOfChannels, totalFrames, audioCtx.sampleRate);
+    if (newDuration <= 0) throw new Error("Trimmed duration is 0");
 
-      let currentTimeOffset = 0;
-      validRegions.forEach(region => {
-        const source = offlineCtx.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(offlineCtx.destination);
-        source.start(currentTimeOffset, region.start, region.duration);
-        currentTimeOffset += region.duration;
-      });
+    const totalFrames = Math.max(1, Math.ceil(audioCtx.sampleRate * newDuration));
+    const offlineCtx = new OfflineAudioContext(audioBuffer.numberOfChannels, totalFrames, audioCtx.sampleRate);
 
-      const renderedBuffer = await offlineCtx.startRendering();
-      const blob = bufferToWave(renderedBuffer, renderedBuffer.length);
-      
-      console.log("✅ [Slicer] Success! Creating new file...");
-      return new File([blob], `Trimmed_${Date.now()}.wav`, { type: "audio/wav" });
-      
-    } catch (error) {
-      console.error("💥 [Slicer CRITICAL ERROR]:", error);
-      throw error; // إعادة توجيه الخطأ ليظهر في التنبيهات
-    }
-  };
+    let currentTimeOffset = 0;
+    validRegions.forEach(region => {
+      const source = offlineCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(offlineCtx.destination);
+      source.start(currentTimeOffset, region.start, region.duration);
+      currentTimeOffset += region.duration;
+    });
 
-// --- دالة تشغيل القص (مع صائد الأخطاء الشامل) ---
-// --- دالة القص الذكي (ترسم فقط ولا تقطع) ---
-  const handleSmartTrimSilence = async () => {
-    if (!activeTranscriptId) return alert("⚠️ Please load or fetch an API Transcript first!");
-    setIsProcessing(true);
-    setProcessLog(`✂️ Scanning timeline for dead air...`);
-    
-    try {
-      const token = localStorage.getItem("token");
-      const response = await fetch(`http://localhost:5000/api/trim-silence/${activeTranscriptId}`, {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ mode: trimmerMode })
-      });
-      
-      if (!response.ok) throw new Error("Backend response not OK");
-      const data = await response.json();
+    const renderedBuffer = await offlineCtx.startRendering();
+    const blob = bufferToWave(renderedBuffer, renderedBuffer.length);
+    return new File([blob], `Trimmed_${Date.now()}.wav`, { type: "audio/wav" });
+  } catch (error) {
+    throw error; 
+  }
+};
 
-      if (data.timeSaved > 0 && data.keptRegions && data.keptRegions.length > 0) {
-        // +++ تحويل "المناطق المحفوظة" إلى "فراغات محذوفة" لكي نرسمها بالأحمر +++
-        let silences = [];
-        
-        // الفراغ قبل أول منطقة (إذا كان هناك سكوت في البداية)
-        if (data.keptRegions[0].start > 0) {
-            silences.push({ start: 0, end: data.keptRegions[0].start });
-        }
-        // الفراغات بين المناطق
-        for (let i = 0; i < data.keptRegions.length - 1; i++) {
-            if (data.keptRegions[i+1].start > data.keptRegions[i].end) {
-                silences.push({ start: data.keptRegions[i].end, end: data.keptRegions[i+1].start });
-            }
-        }
-
-        setSuggestedSilences(silences); // إرسالها للموجة لترسمها!
-        pushToHistory({ transcriptionData: data.chunks });
-        
-        alert(`🤖 AI Analysis Complete!\nFound ${silences.length} silence gaps.\nThey are highlighted in RED on the waveform. Review them and click 'Apply Manual Cuts' to slice the audio.`);
-      } else {
-        alert(`ℹ️ Notice: No significant silence detected.`);
-      }
-    } catch (error) {
-      alert(`❌ Process Failed: ${error.message}`);
-    } finally {
-      setIsProcessing(false);
-      setProcessLog("");
-    }
-  };
-
-  // --- دالة التنفيذ الفيزيائي للقص (بعد موافقة المستخدم) ---
-  const handleManualCuts = async (keptRegions) => {
-    if (!audioFile) return;
-    setIsProcessing(true);
-    setProcessLog("✂️ Physically slicing and stitching the audio file... ⏳");
-    try {
-      const trimmedAudioFile = await applyCutsToAudio(audioFile, keptRegions);
-      setAudioFile(trimmedAudioFile); // وضع الملف الجديد في الواجهة
-      setSuggestedSilences([]); // مسح المربعات الحمراء
-      alert(`✨ Success! Audio has been successfully trimmed.\nNew file: ${trimmedAudioFile.name}`);
-    } catch (error) {
-      console.error(error);
-      alert(`🚨 Audio Engine Error: ${error.message}`);
-    } finally {
-      setIsProcessing(false);
-      setProcessLog("");
-    }
-  };
-
-
-  
-// --- دالة توليد الصدى لمحرك التصدير ---
 const generateReverbImpulse = (ctx) => {
   const sampleRate = ctx.sampleRate;
   const length = sampleRate * 2.5; 
@@ -155,48 +76,42 @@ const generateReverbImpulse = (ctx) => {
 };
 
 export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user, setUser }) { 
-  // 1. الحالات الأساسية
   const [audioFile, setAudioFile] = useState(null); 
   const [currentTime, setCurrentTime] = useState(0); 
   const [isPlaying, setIsPlaying] = useState(false); 
   const [duration, setDuration] = useState(0);
-
-  // 2. حالات التحجيم والقفز الزمني
   const [seekToTime, setSeekToTime] = useState(null);
   const [timelineHeight, setTimelineHeight] = useState(288); 
 
-  // 3. محرك التراجع والتقدم (Undo/Redo Engine)
   const [history, setHistory] = useState([{ isSplit: false, isEnhanced: false, transcriptionData: [] }]);
   const [historyIndex, setHistoryIndex] = useState(0);
   const currentState = history[historyIndex];
   const { isSplit, isEnhanced, transcriptionData } = currentState;
 
-  // 4. حالات واجهة الذكاء الاصطناعي والترجمة
   const [isProcessing, setIsProcessing] = useState(false);
   const [processLog, setProcessLog] = useState("");
   const [audioLanguage, setAudioLanguage] = useState("auto"); 
   const [translateTo, setTranslateTo] = useState("none");  
   const [activeTranscriptId, setActiveTranscriptId] = useState(projectId || null);
-  // 7. حالة محرك القص الذكي
-  const [trimmerMode, setTrimmerMode] = useState("ai_speech");
 
-  // 8. حالة الفراغات المقترحة من الذكاء الاصطناعي للرسم
+  const [trimmerMode, setTrimmerMode] = useState("ai_speech");
   const [suggestedSilences, setSuggestedSilences] = useState([]);
-  // 5. حالات الفلاتر الصوتية الحية (Live FX Engine)
+  
+  const [speed, setSpeed] = useState(1); 
   const [pitch, setPitch] = useState(1); 
+  const [isDeEsser, setIsDeEsser] = useState(false);
   const [reverbAmount, setReverbAmount] = useState(0); 
 
-  // +++ 6. حالة تحديد نظام العمل التصديري الجديد +++
-  // 'instant' = تحميل تلقائي بعد كل تعديل | 'multi' = تعديلات متعددة وحفظ يدوي
   const [workflowMode, setWorkflowMode] = useState("multi");
+  
+  const loadingIntervalRef = useRef(null);
 
-  // جلب بيانات المشروع القديم إذا تم تمرير ID
   useEffect(() => {
     setActiveTranscriptId(projectId);
     if (projectId) {
       const fetchSavedProject = async () => {
         setIsProcessing(true);
-        setProcessLog("📥 Loading project data from Database...");
+        setProcessLog("📥 Loading project data...");
         try {
           const res = await fetch(`http://localhost:5000/api/transcript/${projectId}`);
           if (!res.ok) throw new Error("Failed to fetch project");
@@ -215,11 +130,11 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
     }
   }, [projectId]);
 
-  // --- محرك التصدير والتحميل الاحترافي الشامل ---
+  // +++ تحديث التصدير للعمل مع الـ De-Esser الحقيقي +++
   const downloadAudio = async (prefix = "") => {
     if (!audioFile) return;
 
-    if (prefix === "AI_Mastered" && (isEnhanced || pitch !== 1 || reverbAmount > 0)) {
+    if (prefix === "AI_Mastered" && (isEnhanced || speed !== 1 || pitch !== 1 || reverbAmount > 0 || isDeEsser)) {
       setIsProcessing(true);
       setProcessLog("✨ Rendering Audio Matrix with all layers... Please wait.");
 
@@ -227,54 +142,48 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         const arrayBuffer = await audioFile.arrayBuffer();
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-        const newDuration = audioBuffer.duration * (1 / pitch);
         
-        const offlineCtx = new OfflineAudioContext(
-          audioBuffer.numberOfChannels,
-          audioCtx.sampleRate * newDuration, 
-          audioCtx.sampleRate
-        );
+        const totalRate = speed * pitch;
+        const newDuration = audioBuffer.duration * (1 / totalRate);
+        const offlineCtx = new OfflineAudioContext(audioBuffer.numberOfChannels, audioCtx.sampleRate * newDuration, audioCtx.sampleRate);
 
         const source = offlineCtx.createBufferSource();
         source.buffer = audioBuffer;
-        source.playbackRate.value = pitch;
+        source.playbackRate.value = totalRate;
 
-        let activeSource = source;
+        let currentNode = source;
+
+        // تطبيق الـ De-Esser الحقيقي للريندر
+        if (isDeEsser) {
+          const dLow = offlineCtx.createBiquadFilter(); dLow.type = "lowpass"; dLow.frequency.value = 5500;
+          const dHigh = offlineCtx.createBiquadFilter(); dHigh.type = "highpass"; dHigh.frequency.value = 5500;
+          
+          const dComp = offlineCtx.createDynamicsCompressor();
+          dComp.threshold.value = -35; dComp.knee.value = 5; dComp.ratio.value = 15; dComp.attack.value = 0.002; dComp.release.value = 0.05;
+          
+          const dMerge = offlineCtx.createGain();
+
+          currentNode.connect(dLow); dLow.connect(dMerge);
+          currentNode.connect(dHigh); dHigh.connect(dComp); dComp.connect(dMerge);
+
+          currentNode = dMerge;
+        }
 
         if (isEnhanced) {
-          const compressor = offlineCtx.createDynamicsCompressor();
-          compressor.threshold.value = -24;
-          compressor.ratio.value = 12;
-          const eq = offlineCtx.createBiquadFilter();
-          eq.type = "highshelf";
-          eq.frequency.value = 3000;
-          eq.gain.value = 6;
-          const gainNode = offlineCtx.createGain();
-          gainNode.gain.value = 1.5;
-
-          activeSource.connect(compressor);
-          compressor.connect(eq);
-          eq.connect(gainNode);
-          activeSource = gainNode;
+          const compressor = offlineCtx.createDynamicsCompressor(); compressor.threshold.value = -24; compressor.ratio.value = 12;
+          const eq = offlineCtx.createBiquadFilter(); eq.type = "highshelf"; eq.frequency.value = 3000; eq.gain.value = 6;
+          const gainNode = offlineCtx.createGain(); gainNode.gain.value = 1.5;
+          currentNode.connect(compressor); compressor.connect(eq); eq.connect(gainNode); currentNode = gainNode;
         }
 
         if (reverbAmount > 0) {
-          const convolver = offlineCtx.createConvolver();
-          convolver.buffer = generateReverbImpulse(offlineCtx);
-          const dryGain = offlineCtx.createGain();
-          const wetGain = offlineCtx.createGain();
-          const wetRatio = reverbAmount / 100;
-          
-          wetGain.gain.value = wetRatio * 1.5;
-          dryGain.gain.value = 1 - (wetRatio * 0.3);
-
-          activeSource.connect(dryGain);
-          activeSource.connect(convolver);
-          convolver.connect(wetGain);
-          dryGain.connect(offlineCtx.destination);
-          wetGain.connect(offlineCtx.destination);
+          const convolver = offlineCtx.createConvolver(); convolver.buffer = generateReverbImpulse(offlineCtx);
+          const dryGain = offlineCtx.createGain(); const wetGain = offlineCtx.createGain();
+          const wetRatio = reverbAmount / 100; wetGain.gain.value = wetRatio * 1.5; dryGain.gain.value = 1 - (wetRatio * 0.3);
+          currentNode.connect(dryGain); currentNode.connect(convolver); convolver.connect(wetGain);
+          dryGain.connect(offlineCtx.destination); wetGain.connect(offlineCtx.destination);
         } else {
-          activeSource.connect(offlineCtx.destination);
+          currentNode.connect(offlineCtx.destination);
         }
 
         source.start();
@@ -308,19 +217,15 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
     }
   };
 
-  // +++ +++ رادار نظام العمل التلقائي (Auto-Export Trigger) +++ +++
   useEffect(() => {
-    if (workflowMode === "instant" && audioFile && (isEnhanced || pitch !== 1 || reverbAmount > 0)) {
-      // إعطاء المستخدم ثانية واحدة للاستقرار على قيمة المؤشر لمنع تكرار التحميل العشوائي
+    if (workflowMode === "instant" && audioFile && (isEnhanced || speed !== 1 || pitch !== 1 || reverbAmount > 0 || isDeEsser)) {
       const autoSaveTimer = setTimeout(() => {
         downloadAudio("AI_Mastered");
       }, 1200);
-
       return () => clearTimeout(autoSaveTimer);
     }
-  }, [isEnhanced, pitch, reverbAmount, workflowMode]);
+  }, [isEnhanced, speed, pitch, isDeEsser, reverbAmount, workflowMode, audioFile]);
 
-  // --- دوال المساعدة للـ History ---
   const pushToHistory = (newStateChanges) => {
     const updatedState = { ...currentState, ...newStateChanges };
     const newHistory = history.slice(0, historyIndex + 1);
@@ -359,7 +264,6 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
     setHistoryIndex(0);
   };
 
-// --- 1. دالة القص الذكي (هذه ترسم المربعات الحمراء فقط ولا تقطع) ---
   const handleSmartTrimSilence = async () => {
     if (!activeTranscriptId) return alert("⚠️ Please load or fetch an API Transcript first!");
     setIsProcessing(true);
@@ -386,7 +290,6 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
         }
         setSuggestedSilences(silences); 
         pushToHistory({ transcriptionData: data.chunks });
-        alert(`🤖 AI Analysis Complete!\nFound ${silences.length} silence gaps.\nThey are highlighted in RED on the waveform. Review them and click 'Apply Manual Cuts' to slice the audio.`);
       } else {
         alert(`ℹ️ Notice: No significant silence detected.`);
       }
@@ -398,26 +301,39 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
     }
   };
 
-// --- دالة التنفيذ الفيزيائي للقص (مع منع تجمد الشاشة) ---
   const handleManualCuts = async (keptRegions) => {
     if (!audioFile) return;
     
-    // 1. تشغيل واجهة التحميل للمستخدم
     setIsProcessing(true);
-    setProcessLog("✂️ Processing massive audio data... Please wait ⏳");
+    setProcessLog("✂️ Initiating Slicer...");
 
-    // 2. السحر: إجبار المتصفح على أخذ استراحة 100 ملي ثانية لكي يرسم واجهة التحميل قبل أن يتجمد المعالج!
+    let step = 0;
+    loadingIntervalRef.current = setInterval(() => {
+      step++;
+      if(step === 1) setProcessLog("⚙️ Rebuilding Audio Matrix...");
+      if(step === 2) setProcessLog("🧹 Removing Silence Chunks...");
+      if(step === 3) setProcessLog("🪡 Stitching Audio Together...");
+      if(step > 3) setProcessLog("🎨 Drawing New Waveform (Almost done)...");
+    }, 1000);
+
     await new Promise(resolve => setTimeout(resolve, 100));
 
     try {
       const trimmedAudioFile = await applyCutsToAudio(audioFile, keptRegions);
-      setAudioFile(trimmedAudioFile); // وضع الملف الجديد السلس
-      setSuggestedSilences([]); // مسح المربعات الحمراء بعد القص
-      alert(`✨ Success! Audio has been successfully trimmed.\nNew file: ${trimmedAudioFile.name}`);
+      setAudioFile(trimmedAudioFile);
+      setSuggestedSilences([]); 
     } catch (error) {
       console.error(error);
       alert(`🚨 Audio Engine Error: ${error.message}`);
-    } finally {
+      clearInterval(loadingIntervalRef.current);
+      setIsProcessing(false);
+      setProcessLog("");
+    }
+  };
+
+  const handleWaveformReady = () => {
+    if (isProcessing) {
+      clearInterval(loadingIntervalRef.current);
       setIsProcessing(false);
       setProcessLog("");
     }
@@ -469,7 +385,6 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
   return (
     <div className="h-screen w-full bg-[#030303] text-gray-200 flex flex-col overflow-hidden font-sans select-none">
       
-      {/* 1. Header */}
       <header className="h-14 shrink-0 border-b border-gray-900/60 flex items-center justify-between px-6 bg-[#080808]/90 backdrop-blur-md z-30">
         <div className="flex items-center gap-4">
           <button onClick={onBack} className="text-gray-400 hover:text-white transition-all text-sm font-medium flex items-center gap-1 bg-gray-900/40 hover:bg-gray-800/60 px-3 py-1.5 rounded-lg border border-gray-800/50">
@@ -482,7 +397,6 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
           </div>
         </div>
 
-        {/* العداد الذهبي المتمركز في مساحتك المفضلة */}
         <div className="flex items-center gap-4">
           {user && (
             <div className="mr-2 bg-[#0a0a0a] px-4 py-1.5 rounded-xl border border-gray-800 flex items-center gap-3 shadow-inner">
@@ -502,7 +416,7 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
           {audioFile && (
             <div className="flex items-center gap-2 mr-4 border-r border-gray-800 pr-4">
               <button onClick={() => downloadAudio()} className="px-3 py-1.5 bg-gray-900 hover:bg-gray-800 border border-gray-700 text-gray-300 text-xs rounded transition-colors">📥 Original</button>
-              {workflowMode === "multi" && (isEnhanced || pitch !== 1 || reverbAmount > 0) && (
+              {workflowMode === "multi" && (isEnhanced || speed !== 1 || pitch !== 1 || reverbAmount > 0 || isDeEsser) && (
                 <button onClick={() => downloadAudio("AI_Mastered")} className="px-3 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-400 font-bold text-xs rounded transition-colors shadow-lg">✨ Export Master track</button>
               )}
             </div>
@@ -513,139 +427,109 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
         </div>
       </header>
 
-      {/* 2. Main Workspace */}
       <div className="flex-1 flex overflow-hidden min-h-0 relative">
         <aside className="w-72 shrink-0 bg-[#060606] border-r border-gray-950 p-4 flex flex-col gap-4 overflow-y-auto min-w-0 relative">
           
-          {/* +++ +++ أزرار التحكم في نظام العمل الجديد (Workflow Mode Switcher) +++ +++ */}
           <div className="w-full shrink-0 bg-[#0c0d12] border border-gray-800 p-2 rounded-xl flex gap-1">
-            <button 
-              onClick={() => setWorkflowMode("instant")}
-              className={`flex-1 py-2 rounded-lg text-xs font-bold transition-all flex flex-col items-center gap-0.5 ${workflowMode === "instant" ? "bg-gradient-to-r from-amber-500 to-orange-600 text-black shadow-md" : "text-gray-500 hover:text-gray-300"}`}
-            >
-              <span>⚡ Auto-Export</span>
-              <span className="text-[8px] opacity-70">تحميل بعد كل تعديل</span>
+            <button onClick={() => setWorkflowMode("instant")} className={`flex-1 py-2 rounded-lg text-xs font-bold transition-all flex flex-col items-center gap-0.5 ${workflowMode === "instant" ? "bg-gradient-to-r from-amber-500 to-orange-600 text-black shadow-md" : "text-gray-500 hover:text-gray-300"}`}>
+              <span>⚡ Auto-Export</span><span className="text-[8px] opacity-70">تحميل بعد كل تعديل</span>
             </button>
-            <button 
-              onClick={() => setWorkflowMode("multi")}
-              className={`flex-1 py-2 rounded-lg text-xs font-bold transition-all flex flex-col items-center gap-0.5 ${workflowMode === "multi" ? "bg-gradient-to-r from-emerald-500 to-cyan-500 text-black shadow-md" : "text-gray-500 hover:text-gray-300"}`}
-            >
-              <span>🎛️ Studio Rack</span>
-              <span className="text-[8px] opacity-70">تعديلات متعددة</span>
+            <button onClick={() => setWorkflowMode("multi")} className={`flex-1 py-2 rounded-lg text-xs font-bold transition-all flex flex-col items-center gap-0.5 ${workflowMode === "multi" ? "bg-gradient-to-r from-emerald-500 to-cyan-500 text-black shadow-md" : "text-gray-500 hover:text-gray-300"}`}>
+              <span>🎛️ Studio Rack</span><span className="text-[8px] opacity-70">تعديلات متعددة</span>
             </button>
           </div>
 
           <div className="text-[10px] font-mono uppercase tracking-wider text-gray-600 shrink-0">Neural Audio Tools</div>
           
-{/* +++ محرك القص المزدوج الجديد +++ */}
           <div className="w-full shrink-0 bg-[#0a0a0a] border border-gray-800 p-3 rounded-xl flex flex-col gap-3 relative">
-            <div className="flex items-center gap-2">
-              <span className="text-xl">✂️</span>
-              <span className="text-sm font-bold text-gray-200">Smart Trimmer</span>
-            </div>
-            
-            <select 
-              value={trimmerMode}
-              onChange={(e) => setTrimmerMode(e.target.value)}
-              className="bg-[#040404] border border-gray-700 text-xs rounded-lg p-2 text-emerald-400 outline-none focus:border-emerald-500 transition-colors"
-            >
+            <div className="flex items-center gap-2"><span className="text-xl">✂️</span><span className="text-sm font-bold text-gray-200">Smart Trimmer</span></div>
+            <select value={trimmerMode} onChange={(e) => setTrimmerMode(e.target.value)} className="bg-[#040404] border border-gray-700 text-xs rounded-lg p-2 text-emerald-400 outline-none focus:border-emerald-500 transition-colors">
               <option value="ai_speech">🤖 AI Speech Gate (Aggressive Cut)</option>
               <option value="acoustic">🔈 Acoustic Gate (Keep Natural Tone)</option>
             </select>
-
-            <button 
-              onClick={handleSmartTrimSilence} 
-              disabled={isProcessing || !hasTranscriptData} 
-              className={`w-full py-2 bg-gray-900 hover:bg-gray-800 border ${(!hasTranscriptData || isProcessing) ? 'border-gray-900 opacity-50 cursor-not-allowed' : 'border-gray-700 hover:border-emerald-500/40'} rounded-lg text-xs font-bold transition-all text-gray-300`}
-            >
-              Execute Trim
+            <button onClick={handleSmartTrimSilence} disabled={isProcessing || !hasTranscriptData} className={`w-full py-2 bg-gray-900 hover:bg-gray-800 border ${(!hasTranscriptData || isProcessing) ? 'border-gray-900 opacity-50 cursor-not-allowed' : 'border-gray-700 hover:border-emerald-500/40'} rounded-lg text-xs font-bold transition-all text-gray-300`}>
+              Find Silences
             </button>
-            <p className="text-[9px] text-gray-500 leading-relaxed mt-1">
-              {trimmerMode === 'ai_speech' ? "Removes any gap > 0.3s. Good for fast-paced videos." : "Removes only long gaps > 1.2s. Good for natural podcasts."}
-            </p>
           </div>
 
-          {/* محرك الترجمة الذكي */}
           <div className="w-full shrink-0 bg-[#090a0e]/60 border border-purple-500/20 p-3 rounded-xl flex flex-col gap-3 relative overflow-hidden">
-            <div className="absolute top-0 right-0 w-12 h-12 bg-purple-500/5 rounded-full blur-xl"></div>
             <div className="flex items-center gap-3"><span className="text-xl">📝</span><span className="text-sm font-semibold text-purple-400">Cloud AI API</span></div>
-            <div className="flex flex-col gap-1 z-10">
-              <select value={audioLanguage} onChange={(e) => setAudioLanguage(e.target.value)} className="bg-[#040404] border border-gray-800 text-xs rounded-lg p-2 text-gray-300 outline-none">
-                <option value="auto">Auto Detect Language</option>
-                <option value="ja">Japanese (日本語)</option>
-                <option value="en">English (US/UK)</option>
-                <option value="ar">Arabic (العربية)</option>
-              </select>
-            </div>
-            <div className="flex flex-col gap-1 z-10">
-              <select value={translateTo} onChange={(e) => setTranslateTo(e.target.value)} className="bg-[#040404] border border-gray-800 text-xs rounded-lg p-2 text-purple-300 font-medium outline-none">
-                <option value="none">⚠️ Keep Original Language</option>
-                <option value="ar">Translate to Arabic (العربية)</option>
-                <option value="en">Translate to English</option>
-              </select>
-            </div>
-            <button onClick={handleTranscribeWithAPI} disabled={isProcessing} className="w-full mt-2 py-2.5 z-10 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 text-white font-bold text-xs rounded-lg transition-all disabled:opacity-40 shadow-lg">
-              Fetch API Transcript
-            </button>
+            <select value={audioLanguage} onChange={(e) => setAudioLanguage(e.target.value)} className="bg-[#040404] border border-gray-800 text-xs rounded-lg p-2 text-gray-300 outline-none">
+              <option value="auto">Auto Detect Language</option>
+              <option value="ja">Japanese (日本語)</option>
+              <option value="en">English (US/UK)</option>
+              <option value="ar">Arabic (العربية)</option>
+            </select>
+            <select value={translateTo} onChange={(e) => setTranslateTo(e.target.value)} className="bg-[#040404] border border-gray-800 text-xs rounded-lg p-2 text-purple-300 font-medium outline-none">
+              <option value="none">⚠️ Keep Original Language</option>
+              <option value="ar">Translate to Arabic (العربية)</option>
+              <option value="en">Translate to English</option>
+            </select>
+            <button onClick={handleTranscribeWithAPI} disabled={isProcessing} className="w-full mt-2 py-2.5 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 text-white font-bold text-xs rounded-lg transition-all disabled:opacity-40">Fetch API Transcript</button>
           </div>
 
-          {/* رف التأثيرات الاحترافي (FX Rack UI) */}
           <div className="w-full shrink-0 bg-[#070707] border border-gray-800 p-4 rounded-xl flex flex-col gap-4 relative overflow-hidden shadow-inner">
             <div className="text-[10px] font-mono uppercase tracking-wider text-emerald-500 mb-1 flex items-center justify-between">
-              <span className="flex items-center gap-2">
-                <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></span>
-                Active FX Rack
-              </span>
-              {workflowMode === "instant" && <span className="text-[9px] text-amber-500 font-bold animate-pulse">⚡ Auto Mode Active</span>}
+              <span className="flex items-center gap-2"><span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></span>Active FX Rack</span>
             </div>
             
-            {/* Layer 1: Auto Mastering */}
             <div className={`p-3 rounded-lg border transition-all ${isEnhanced ? 'bg-emerald-900/10 border-emerald-500/30' : 'bg-[#0a0a0a] border-gray-800'}`}>
               <div className="flex justify-between items-center mb-1">
                 <span className={`text-xs font-bold ${isEnhanced ? 'text-emerald-400' : 'text-gray-400'}`}>✨ Studio Mastering</span>
                 <label className="relative inline-flex items-center cursor-pointer">
                   <input type="checkbox" className="sr-only peer" checked={isEnhanced} onChange={() => pushToHistory({ isEnhanced: !isEnhanced })} />
-                  <div className="w-7 h-4 bg-gray-700 peer-focus:outline-none rounded-full peer peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-emerald-500"></div>
+                  <div className="w-7 h-4 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-emerald-500"></div>
                 </label>
               </div>
               <p className="text-[9px] text-gray-500">EQ & Balanced Compression</p>
             </div>
 
-            {/* Layer 2: Voice Morph */}
+            <div className={`p-3 rounded-lg border transition-all ${isDeEsser ? 'bg-blue-900/10 border-blue-500/30' : 'bg-[#0a0a0a] border-gray-800'}`}>
+              <div className="flex justify-between items-center mb-1">
+                <span className={`text-xs font-bold ${isDeEsser ? 'text-blue-400' : 'text-gray-400'}`}>🤫 De-Esser (S-Softener)</span>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input type="checkbox" className="sr-only peer" checked={isDeEsser} onChange={() => setIsDeEsser(!isDeEsser)} />
+                  <div className="w-7 h-4 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-blue-500"></div>
+                </label>
+              </div>
+              <p className="text-[9px] text-gray-500">Multi-band High Frequency Compression</p>
+            </div>
+
+            {/* +++ مؤشر الـ Pitch المتقدم للتحكم المريح +++ */}
             <div className={`p-3 rounded-lg border transition-all ${pitch !== 1 ? 'bg-purple-900/10 border-purple-500/30' : 'bg-[#0a0a0a] border-gray-800'}`}>
               <div className="flex justify-between items-center mb-3">
-                <span className={`text-xs font-bold ${pitch !== 1 ? 'text-purple-400' : 'text-gray-400'}`}>🎭 Voice Morph</span>
+                <span className={`text-xs font-bold ${pitch !== 1 ? 'text-purple-400' : 'text-gray-400'}`}>🎭 Voice Morph (Pitch)</span>
                 <span className="text-xs font-mono bg-black px-1.5 rounded text-gray-400">{pitch.toFixed(2)}x</span>
               </div>
-              <input type="range" min="0.5" max="1.5" step="0.05" value={pitch} onChange={(e) => setPitch(parseFloat(e.target.value))} className="w-full h-1 bg-gray-800 rounded-lg appearance-none cursor-pointer accent-purple-500" />
+              <input type="range" min="0.5" max="2" step="0.05" value={pitch} onChange={(e) => setPitch(parseFloat(e.target.value))} className="w-full h-1 bg-gray-800 rounded-lg appearance-none cursor-pointer accent-purple-500" />
               <div className="flex justify-between text-[8px] text-gray-500 font-mono mt-1">
                 <button onClick={() => setPitch(0.7)} className="hover:text-purple-400">Deep</button>
-                <button onClick={() => setPitch(1)} className="hover:text-gray-300">Reset</button>
-                <button onClick={() => setPitch(1.3)} className="hover:text-purple-400">High</button>
+                <button onClick={() => setPitch(1)} className="hover:text-gray-300">Normal</button>
+                <button onClick={() => setPitch(1.3)} className="hover:text-purple-400">Thin</button>
               </div>
             </div>
 
-            {/* Layer 3: Reverb */}
+            <div className={`p-3 rounded-lg border transition-all ${speed !== 1 ? 'bg-amber-900/10 border-amber-500/30' : 'bg-[#0a0a0a] border-gray-800'}`}>
+              <div className="flex justify-between items-center mb-3">
+                <span className={`text-xs font-bold ${speed !== 1 ? 'text-amber-400' : 'text-gray-400'}`}>⏱️ Speed</span>
+                <span className="text-xs font-mono bg-black px-1.5 rounded text-gray-400">{speed.toFixed(2)}x</span>
+              </div>
+              <input type="range" min="0.5" max="2" step="0.1" value={speed} onChange={(e) => setSpeed(parseFloat(e.target.value))} className="w-full h-1 bg-gray-800 rounded-lg appearance-none cursor-pointer accent-amber-500" />
+              <div className="flex justify-between text-[8px] text-gray-500 font-mono mt-1">
+                <button onClick={() => setSpeed(0.5)} className="hover:text-amber-400">Slow</button>
+                <button onClick={() => setSpeed(1)} className="hover:text-gray-300">1.0x</button>
+                <button onClick={() => setSpeed(2)} className="hover:text-amber-400">Fast</button>
+              </div>
+            </div>
+
             <div className={`p-3 rounded-lg border transition-all ${reverbAmount > 0 ? 'bg-cyan-900/10 border-cyan-500/30' : 'bg-[#0a0a0a] border-gray-800'}`}>
               <div className="flex justify-between items-center mb-3">
                 <span className={`text-xs font-bold ${reverbAmount > 0 ? 'text-cyan-400' : 'text-gray-400'}`}>🏛️ Space Reverb</span>
                 <span className="text-xs font-mono bg-black px-1.5 rounded text-gray-400">{reverbAmount}%</span>
               </div>
               <input type="range" min="0" max="100" step="1" value={reverbAmount} onChange={(e) => setReverbAmount(parseFloat(e.target.value))} className="w-full h-1 bg-gray-800 rounded-lg appearance-none cursor-pointer accent-cyan-500" />
-              <div className="flex justify-between text-[8px] text-gray-500 font-mono mt-1">
-                <button onClick={() => setReverbAmount(0)} className="hover:text-gray-300">Off</button>
-                <button onClick={() => setReverbAmount(50)} className="hover:text-cyan-400">Room</button>
-                <button onClick={() => setReverbAmount(100)} className="hover:text-cyan-400">Hall</button>
-              </div>
             </div>
           </div>
-
-          {isProcessing && (
-            <div className="absolute bottom-4 left-4 right-4 bg-[#081510]/95 border border-emerald-500/30 p-3 rounded-xl backdrop-blur-sm animate-pulse z-50">
-              <div className="text-[10px] text-emerald-400 font-mono flex items-center gap-2 mb-1"><span className="w-2 h-2 bg-emerald-400 rounded-full animate-ping"></span>PROCESSING...</div>
-              <div className="text-xs text-gray-300 font-mono leading-tight">{processLog}</div>
-            </div>
-          )}
         </aside>
 
         <main className="flex-1 bg-[#040404] p-6 flex flex-row items-center justify-center relative min-w-0 z-10 shadow-2xl gap-6 overflow-hidden">
@@ -660,17 +544,22 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
                     onClear={() => { 
                       setAudioFile(null); setCurrentTime(0); setDuration(0); setHistoryIndex(0); 
                       setHistory([{ isSplit: false, isEnhanced: false, transcriptionData: [] }]);
-                      setPitch(1); setReverbAmount(0); setSuggestedSilences([]); 
+                      setSpeed(1); setPitch(1); setIsDeEsser(false); setReverbAmount(0); setSuggestedSilences([]); 
                     }} 
                     onTimeUpdate={setCurrentTime}
                     onPlayStateChange={setIsPlaying}
                     onDurationChange={setDuration}
                     seekToTime={seekToTime} 
                     isEnhanced={isEnhanced}
-                    pitch={pitch}
+                    speed={speed} 
+                    pitch={pitch} 
+                    isDeEsser={isDeEsser} 
                     reverbAmount={reverbAmount}
                     suggestedSilences={suggestedSilences} 
-                    onApplyManualCuts={handleManualCuts} 
+                    onApplyManualCuts={handleManualCuts}
+                    isProcessing={isProcessing}
+                    processLog={processLog}
+                    onReady={handleWaveformReady}
                   />
                 ) : (
                   <div className="w-full max-w-2xl p-12 border-2 border-dashed border-gray-800 rounded-3xl flex flex-col items-center justify-center bg-gray-900/10 backdrop-blur-sm">
@@ -691,12 +580,10 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
         </main>
       </div>
 
-      {/* 3. Timeline Resizer */}
       <div onMouseDown={handleDragStart} className="h-1.5 w-full bg-gray-900 hover:bg-emerald-500/50 cursor-ns-resize flex items-center justify-center z-50 transition-colors">
         <div className="w-12 h-[2px] bg-gray-500 rounded-full"></div>
       </div>
 
-      {/* 4. Timeline */}
       <footer className="shrink-0 bg-[#070707] flex flex-col min-h-0 z-20 relative" style={{ height: `${timelineHeight}px` }}>
         <div className="h-10 border-b border-gray-900 bg-[#0a0a0a] px-4 flex items-center justify-between text-xs text-gray-500 font-mono z-20 shrink-0">
           <div className="flex items-center gap-4">
@@ -719,7 +606,6 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
           </div>
         </div>
       </footer>
-
     </div>
   );
 }
