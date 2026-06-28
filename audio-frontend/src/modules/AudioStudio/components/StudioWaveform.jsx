@@ -18,8 +18,8 @@ const generateReverbImpulse = (ctx) => {
 
 export default function StudioWaveform({ 
   file, onClear, onTimeUpdate, onPlayStateChange, onDurationChange, seekToTime, 
-  isEnhanced, speed = 1, pitch = 0, isDeEsser = false, reverbAmount = 0,
-  onApplyManualCuts, suggestedSilences = [], isProcessing = false, processLog = "", onReady 
+  isEnhanced, speed = 1, pitch = 0, deEsserMode = 'none', interactionMode = 'cut', reverbAmount = 0,
+  onApplyManualCuts, onExtractFingerprint, suggestedSilences = [], isProcessing = false, processLog = "", onReady 
 }) {
   const waveformRef = useRef(null);
   const wsRef = useRef(null);
@@ -32,7 +32,6 @@ export default function StudioWaveform({
   const dryGainRef = useRef(null);
   const wetGainRef = useRef(null);
   
-  // عُقد De-Esser الاحترافية (Multiband Compressor)
   const deEsserLowRef = useRef(null);
   const deEsserHighRef = useRef(null);
   const deEsserCompRef = useRef(null);
@@ -53,8 +52,7 @@ export default function StudioWaveform({
       cursorColor: '#ffffff', barWidth: 2, barGap: 2, barRadius: 2, height: 120, normalize: true,
     });
     const wsRegions = ws.registerPlugin(RegionsPlugin.create());
-    wsRegions.enableDragSelection({ color: 'rgba(239, 68, 68, 0.3)' });
-
+    
     wsRef.current = ws; wsRegionsRef.current = wsRegions;
 
     ws.on('ready', () => {
@@ -75,10 +73,26 @@ export default function StudioWaveform({
     };
   }, []);
 
+  // +++ السحر هنا: تغيير لون التحديد بناءً على وضع الأداة (قص أحمر أو بصمة أصفر) +++
   useEffect(() => {
+    if (wsRegionsRef.current) {
+        wsRegionsRef.current.enableDragSelection({ 
+            color: interactionMode === 'de_ess' ? 'rgba(234, 179, 8, 0.4)' : 'rgba(239, 68, 68, 0.3)' 
+        });
+    }
+  }, [interactionMode]);
+  
+useEffect(() => {
     if (file && wsRef.current) {
       const url = URL.createObjectURL(file);
-      wsRef.current.load(url);
+      
+      // +++ إضافة catch لتجاهل خطأ AbortError الطبيعي +++
+      wsRef.current.load(url).catch(err => {
+          if (err.name !== 'AbortError') {
+              console.error('WaveSurfer loading error:', err);
+          }
+      });
+
       if (wsRegionsRef.current) wsRegionsRef.current.clearRegions();
       return () => URL.revokeObjectURL(url);
     }
@@ -105,21 +119,15 @@ export default function StudioWaveform({
     const source = ctx.createMediaElementSource(mediaElement);
     sourceNodeRef.current = source;
 
-    // ==========================================
-    // 🎛️ De-Esser حقيقي (ضاغط ديناميكي متعدد الموجات)
-    // ==========================================
     const dLow = ctx.createBiquadFilter(); dLow.type = "lowpass"; dLow.frequency.value = 5500;
     const dHigh = ctx.createBiquadFilter(); dHigh.type = "highpass"; dHigh.frequency.value = 5500;
-    
     const dComp = ctx.createDynamicsCompressor();
     dComp.threshold.value = -35; dComp.knee.value = 5; dComp.ratio.value = 20; 
     dComp.attack.value = 0.002; dComp.release.value = 0.05;
-    
     const dMerge = ctx.createGain();
 
     deEsserLowRef.current = dLow; deEsserHighRef.current = dHigh;
     deEsserCompRef.current = dComp; deEsserMergeRef.current = dMerge;
-    // ==========================================
 
     const compressor = ctx.createDynamicsCompressor();
     compressor.threshold.value = -24; compressor.ratio.value = 12;
@@ -148,7 +156,6 @@ export default function StudioWaveform({
     if (!audioCtxRef.current || !sourceNodeRef.current) return;
     const ctx = audioCtxRef.current;
     
-    // قطع الاتصالات بأمان لتجنب الشاشة السوداء!
     try { sourceNodeRef.current.disconnect(); } catch(e){}
     try { deEsserLowRef.current.disconnect(); } catch(e){}
     try { deEsserHighRef.current.disconnect(); } catch(e){}
@@ -159,16 +166,16 @@ export default function StudioWaveform({
 
     let currentNode = sourceNodeRef.current;
 
-    // تشغيل الـ De-Esser الاحترافي
-    if (isDeEsser) {
+    if (deEsserMode !== 'none') {
+        // إذا كان الوضع يدوي، الضاغط يكون أكثر شراسة بكثير لاستهداف البصمة الدقيقة
+        deEsserCompRef.current.threshold.value = deEsserMode === 'manual' ? -45 : -30;
+        deEsserCompRef.current.ratio.value = deEsserMode === 'manual' ? 20 : 12;
+
         currentNode.connect(deEsserLowRef.current);
         currentNode.connect(deEsserHighRef.current);
-        
         deEsserLowRef.current.connect(deEsserMergeRef.current);
-        
         deEsserHighRef.current.connect(deEsserCompRef.current);
         deEsserCompRef.current.connect(deEsserMergeRef.current);
-        
         currentNode = deEsserMergeRef.current;
     }
 
@@ -184,25 +191,18 @@ export default function StudioWaveform({
     if (ctx.state === 'suspended') ctx.resume();
   };
 
-  useEffect(() => { applyRouting(); }, [isEnhanced, isDeEsser]);
+  useEffect(() => { applyRouting(); }, [isEnhanced, deEsserMode]);
 
-  // +++ السحر هنا: التحكم بالـ Pitch الكلاسيكي (تخشين/ترقيق) بشكل منفصل عن السرعة +++
   useEffect(() => {
     if (wsRef.current) {
       const mediaEl = wsRef.current.getMediaElement();
-      // تحويل الدرجات (-12 إلى 12) إلى نسبة رياضية دقيقة
       const pitchMultiplier = Math.pow(2, pitch / 12);
-      
       if (mediaEl) {
-        // إذا كان pitch يساوي 0 (طبيعي)، المتصفح يحافظ على النبرة أثناء تغيير السرعة العادية.
-        // وإلا، المتصفح يسمح للسرعة بتغيير النبرة (تأثير السنجاب والوحش)!
         mediaEl.preservesPitch = (pitch === 0);
         mediaEl.webkitPreservesPitch = (pitch === 0); 
       }
-      
       wsRef.current.setPlaybackRate(speed * pitchMultiplier);
     }
-
     if (wetGainRef.current && dryGainRef.current) {
       const wetRatio = reverbAmount / 100;
       wetGainRef.current.gain.value = wetRatio * 1.5; 
@@ -219,22 +219,27 @@ export default function StudioWaveform({
     if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') audioCtxRef.current.resume();
   };
 
-  const handleApplyManualCuts = () => {
+  const handleApplyAction = () => {
     if (!wsRegionsRef.current) return;
-    const cutRegions = wsRegionsRef.current.getRegions().map(r => ({ start: r.start, end: r.end }));
-    
-    if (cutRegions.length === 0) return alert("⚠️ Please highlight at least one red region on the waveform to cut!");
-    cutRegions.sort((a, b) => a.start - b.start);
+    const regions = wsRegionsRef.current.getRegions();
+    if (regions.length === 0) return alert("⚠️ Please highlight a region on the waveform first!");
 
-    let keptRegions = [];
-    let currentStart = 0;
-    for (let cut of cutRegions) {
-        if (cut.start > currentStart) keptRegions.push({ start: currentStart, end: cut.start });
-        currentStart = Math.max(currentStart, cut.end);
+    if (interactionMode === 'cut') {
+        const cutRegions = regions.map(r => ({ start: r.start, end: r.end }));
+        cutRegions.sort((a, b) => a.start - b.start);
+        let keptRegions = [];
+        let currentStart = 0;
+        for (let cut of cutRegions) {
+            if (cut.start > currentStart) keptRegions.push({ start: currentStart, end: cut.start });
+            currentStart = Math.max(currentStart, cut.end);
+        }
+        if (currentStart < duration) keptRegions.push({ start: currentStart, end: duration });
+        if (onApplyManualCuts) onApplyManualCuts(keptRegions);
+    } else if (interactionMode === 'de_ess') {
+        // استخراج البصمة
+        const targetRegion = { start: regions[0].start, end: regions[0].end };
+        if (onExtractFingerprint) onExtractFingerprint(targetRegion);
     }
-    if (currentStart < duration) keptRegions.push({ start: currentStart, end: duration });
-
-    if (onApplyManualCuts) onApplyManualCuts(keptRegions);
   };
 
   const formatTime = (secs) => {
@@ -249,28 +254,29 @@ export default function StudioWaveform({
       
       {isProcessing && (
         <div className="absolute inset-0 z-50 bg-black/90 backdrop-blur-md flex flex-col items-center justify-center rounded-3xl transition-opacity duration-300">
-            <div className="w-16 h-16 border-4 border-emerald-500 border-t-transparent rounded-full animate-spin mb-4 shadow-[0_0_20px_rgba(16,185,129,0.5)]"></div>
-            <h2 className="text-emerald-400 font-bold text-xl tracking-widest animate-pulse">{processLog || "⚙️ PROCESSING..."}</h2>
+            <div className={`w-16 h-16 border-4 ${interactionMode === 'de_ess' ? 'border-yellow-500' : 'border-emerald-500'} border-t-transparent rounded-full animate-spin mb-4 shadow-[0_0_20px_rgba(16,185,129,0.5)]`}></div>
+            <h2 className={`${interactionMode === 'de_ess' ? 'text-yellow-400' : 'text-emerald-400'} font-bold text-xl tracking-widest animate-pulse`}>{processLog || "⚙️ PROCESSING..."}</h2>
             <div className="mt-4 flex gap-1">
-              <span className="w-2 h-2 bg-emerald-500 rounded-full animate-bounce"></span>
-              <span className="w-2 h-2 bg-emerald-500 rounded-full animate-bounce" style={{animationDelay: "0.1s"}}></span>
-              <span className="w-2 h-2 bg-emerald-500 rounded-full animate-bounce" style={{animationDelay: "0.2s"}}></span>
+              <span className={`w-2 h-2 ${interactionMode === 'de_ess' ? 'bg-yellow-500' : 'bg-emerald-500'} rounded-full animate-bounce`}></span>
+              <span className={`w-2 h-2 ${interactionMode === 'de_ess' ? 'bg-yellow-500' : 'bg-emerald-500'} rounded-full animate-bounce`} style={{animationDelay: "0.1s"}}></span>
+              <span className={`w-2 h-2 ${interactionMode === 'de_ess' ? 'bg-yellow-500' : 'bg-emerald-500'} rounded-full animate-bounce`} style={{animationDelay: "0.2s"}}></span>
             </div>
         </div>
       )}
 
-      {(isEnhanced || reverbAmount > 0 || speed !== 1 || pitch !== 0 || isDeEsser) && (
-         <div className="absolute inset-0 bg-emerald-500/5 pointer-events-none animate-pulse"></div>
+      {(isEnhanced || reverbAmount > 0 || speed !== 1 || pitch !== 0 || deEsserMode !== 'none') && (
+         <div className={`absolute inset-0 ${deEsserMode === 'manual' ? 'bg-yellow-500/5' : 'bg-emerald-500/5'} pointer-events-none animate-pulse`}></div>
       )}
       
       <div className="flex justify-between items-start mb-6">
         <div className="flex items-center gap-3 relative z-10">
-           <div className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${(isEnhanced || speed !== 1 || pitch !== 0) ? 'bg-emerald-500/20 text-emerald-400' : 'bg-gray-800 text-gray-400'}`}>🎙️</div>
+           <div className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${(isEnhanced || speed !== 1 || pitch !== 0 || deEsserMode !== 'none') ? (deEsserMode === 'manual' ? 'bg-yellow-500/20 text-yellow-400' : 'bg-emerald-500/20 text-emerald-400') : 'bg-gray-800 text-gray-400'}`}>🎙️</div>
            <div>
              <h3 className="text-gray-200 font-bold text-sm max-w-[200px] truncate">{file?.name || "Audio Track"}</h3>
              <div className="flex flex-wrap items-center gap-2 text-[10px] font-mono text-gray-500 mt-1">
                {isEnhanced && <span className="text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">✨ Enhanced</span>}
-               {isDeEsser && <span className="text-blue-400 bg-blue-500/10 px-2 py-0.5 rounded border border-blue-500/20">🤫 De-Esser</span>}
+               {deEsserMode === 'auto' && <span className="text-blue-400 bg-blue-500/10 px-2 py-0.5 rounded border border-blue-500/20">🪄 AI De-Ess</span>}
+               {deEsserMode === 'manual' && <span className="text-yellow-400 bg-yellow-500/10 px-2 py-0.5 rounded border border-yellow-500/20">🎯 Target 'S'</span>}
                {pitch !== 0 && <span className="text-purple-400 bg-purple-500/10 px-2 py-0.5 rounded border border-purple-500/20">🎭 Pitch {pitch > 0 ? `+${pitch}` : pitch} st</span>}
                {speed !== 1 && <span className="text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20">⏱️ Speed {speed}x</span>}
              </div>
@@ -278,8 +284,24 @@ export default function StudioWaveform({
         </div>
 
         <div className="flex items-center gap-3 z-10">
-            <div className="text-[9px] text-red-400/70 text-right leading-tight mr-2 hidden sm:block">Drag on waveform to select silence.<br/>Click a red box to delete it.</div>
-            <button onClick={handleApplyManualCuts} className="px-4 py-2 bg-red-600/20 hover:bg-red-600/40 border border-red-500/50 text-red-400 text-xs font-bold rounded-lg transition-colors shadow-lg">✂️ Execute Cuts</button>
+            <div className="text-[9px] text-right leading-tight mr-2 hidden sm:block font-bold">
+                {interactionMode === 'de_ess' ? (
+                    <span className="text-yellow-400/80 animate-pulse">Draw a <span className="text-yellow-300 uppercase">YELLOW</span> box<br/>over a single bad 'S' sound.</span>
+                ) : (
+                    <span className="text-red-400/70">Drag on waveform to select silence.<br/>Click a red box to delete it.</span>
+                )}
+            </div>
+            
+            {interactionMode === 'de_ess' ? (
+                <button onClick={handleApplyAction} className="px-4 py-2 bg-yellow-600/20 hover:bg-yellow-600/40 border border-yellow-500/50 text-yellow-400 text-xs font-bold rounded-lg transition-colors shadow-[0_0_15px_rgba(234,179,8,0.2)]">
+                    🎯 Extract 'S' Fingerprint
+                </button>
+            ) : (
+                <button onClick={handleApplyAction} className="px-4 py-2 bg-red-600/20 hover:bg-red-600/40 border border-red-500/50 text-red-400 text-xs font-bold rounded-lg transition-colors shadow-lg">
+                    ✂️ Execute Cuts
+                </button>
+            )}
+            
             <button onClick={onClear} className="text-gray-500 hover:text-red-400 transition-colors text-2xl ml-2">×</button>
         </div>
       </div>

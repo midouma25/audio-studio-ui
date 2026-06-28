@@ -61,20 +61,6 @@ const applyCutsToAudio = async (file, keptRegions) => {
   }
 };
 
-const generateReverbImpulse = (ctx) => {
-  const sampleRate = ctx.sampleRate;
-  const length = sampleRate * 2.5; 
-  const impulse = ctx.createBuffer(2, length, sampleRate);
-  const left = impulse.getChannelData(0);
-  const right = impulse.getChannelData(1);
-  for (let i = 0; i < length; i++) {
-    const decay = Math.pow(1 - i / length, 3);
-    left[i] = (Math.random() * 2 - 1) * decay;
-    right[i] = (Math.random() * 2 - 1) * decay;
-  }
-  return impulse;
-};
-
 export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user, setUser }) { 
   const [audioFile, setAudioFile] = useState(null); 
   const [currentTime, setCurrentTime] = useState(0); 
@@ -99,7 +85,8 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
   
   const [speed, setSpeed] = useState(1); 
   const [pitch, setPitch] = useState(0); 
-  const [isDeEsser, setIsDeEsser] = useState(false);
+  const [deEsserMode, setDeEsserMode] = useState('none'); 
+  const [interactionMode, setInteractionMode] = useState('cut'); 
   const [reverbAmount, setReverbAmount] = useState(0); 
 
   const [workflowMode, setWorkflowMode] = useState("multi");
@@ -133,7 +120,7 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
   const downloadAudio = async (prefix = "") => {
     if (!audioFile) return;
 
-    if (prefix === "AI_Mastered" && (isEnhanced || speed !== 1 || pitch !== 0 || reverbAmount > 0 || isDeEsser)) {
+    if (prefix === "AI_Mastered" && (isEnhanced || speed !== 1 || pitch !== 0 || reverbAmount > 0 || deEsserMode !== 'none')) {
       setIsProcessing(true);
       setProcessLog("✨ Rendering Audio Matrix with all layers... Please wait.");
 
@@ -142,7 +129,6 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
         const arrayBuffer = await audioFile.arrayBuffer();
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
         
-        // حساب المضاعف السحري للسرعة والنبرة!
         const pitchMultiplier = Math.pow(2, pitch / 12);
         const totalRate = speed * pitchMultiplier;
 
@@ -155,11 +141,13 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
 
         let currentNode = source;
 
-        if (isDeEsser) {
+        if (deEsserMode !== 'none') {
           const dLow = offlineCtx.createBiquadFilter(); dLow.type = "lowpass"; dLow.frequency.value = 5500;
           const dHigh = offlineCtx.createBiquadFilter(); dHigh.type = "highpass"; dHigh.frequency.value = 5500;
           const dComp = offlineCtx.createDynamicsCompressor();
-          dComp.threshold.value = -35; dComp.knee.value = 5; dComp.ratio.value = 20; dComp.attack.value = 0.002; dComp.release.value = 0.05;
+          dComp.threshold.value = deEsserMode === 'manual' ? -45 : -30;
+          dComp.knee.value = 5; dComp.ratio.value = deEsserMode === 'manual' ? 20 : 12; 
+          dComp.attack.value = 0.002; dComp.release.value = 0.05;
           const dMerge = offlineCtx.createGain();
 
           currentNode.connect(dLow); dLow.connect(dMerge);
@@ -174,15 +162,11 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
           currentNode.connect(compressor); compressor.connect(eq); eq.connect(gainNode); currentNode = gainNode;
         }
 
-        if (reverbAmount > 0) {
-          const convolver = offlineCtx.createConvolver(); convolver.buffer = generateReverbImpulse(offlineCtx);
-          const dryGain = offlineCtx.createGain(); const wetGain = offlineCtx.createGain();
-          const wetRatio = reverbAmount / 100; wetGain.gain.value = wetRatio * 1.5; dryGain.gain.value = 1 - (wetRatio * 0.3);
-          currentNode.connect(dryGain); currentNode.connect(convolver); convolver.connect(wetGain);
-          dryGain.connect(offlineCtx.destination); wetGain.connect(offlineCtx.destination);
-        } else {
-          currentNode.connect(offlineCtx.destination);
-        }
+        const convolver = offlineCtx.createConvolver(); convolver.buffer = generateReverbImpulse(offlineCtx);
+        const dryGain = offlineCtx.createGain(); const wetGain = offlineCtx.createGain();
+        const wetRatio = reverbAmount / 100; wetGain.gain.value = wetRatio * 1.5; dryGain.gain.value = 1 - (wetRatio * 0.3);
+        currentNode.connect(dryGain); currentNode.connect(convolver); convolver.connect(wetGain);
+        dryGain.connect(offlineCtx.destination); wetGain.connect(offlineCtx.destination);
 
         source.start();
         const renderedBuffer = await offlineCtx.startRendering();
@@ -216,13 +200,11 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
   };
 
   useEffect(() => {
-    if (workflowMode === "instant" && audioFile && (isEnhanced || speed !== 1 || pitch !== 0 || reverbAmount > 0 || isDeEsser)) {
-      const autoSaveTimer = setTimeout(() => {
-        downloadAudio("AI_Mastered");
-      }, 1200);
+    if (workflowMode === "instant" && audioFile && (isEnhanced || speed !== 1 || pitch !== 0 || reverbAmount > 0 || deEsserMode !== 'none')) {
+      const autoSaveTimer = setTimeout(() => { downloadAudio("AI_Mastered"); }, 1200);
       return () => clearTimeout(autoSaveTimer);
     }
-  }, [isEnhanced, speed, pitch, isDeEsser, reverbAmount, workflowMode, audioFile]);
+  }, [isEnhanced, speed, pitch, deEsserMode, reverbAmount, workflowMode, audioFile]);
 
   const pushToHistory = (newStateChanges) => {
     const updatedState = { ...currentState, ...newStateChanges };
@@ -301,7 +283,6 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
 
   const handleManualCuts = async (keptRegions) => {
     if (!audioFile) return;
-    
     setIsProcessing(true);
     setProcessLog("✂️ Initiating Slicer...");
 
@@ -311,7 +292,7 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
       if(step === 1) setProcessLog("⚙️ Rebuilding Audio Matrix...");
       if(step === 2) setProcessLog("🧹 Removing Silence Chunks...");
       if(step === 3) setProcessLog("🪡 Stitching Audio Together...");
-      if(step > 3) setProcessLog("🎨 Drawing New Waveform (Almost done)...");
+      if(step > 3) setProcessLog("🎨 Drawing New Waveform...");
     }, 1000);
 
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -323,6 +304,111 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
     } catch (error) {
       console.error(error);
       alert(`🚨 Audio Engine Error: ${error.message}`);
+      clearInterval(loadingIntervalRef.current);
+      setIsProcessing(false);
+      setProcessLog("");
+    }
+  };
+
+  const handleExtractFingerprint = async () => {
+    if (!audioFile) return;
+    setIsProcessing(true);
+    setProcessLog("🎛️ Initializing Studio Engine...");
+
+    let step = 0;
+    loadingIntervalRef.current = setInterval(() => {
+      step++;
+      if(step === 1) setProcessLog("🔄 Transcoding to Pure WAV...");
+      if(step === 2) setProcessLog("🎚️ Applying Dynamic Multiband Compressor...");
+      if(step === 3) setProcessLog("🤫 Suppressing Sibilance ('S' sounds)...");
+      if(step > 3) setProcessLog("✨ Rendering Final Master...");
+    }, 800);
+
+    try {
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const arrayBuffer = await audioFile.arrayBuffer();
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+      
+      const wavBlob = bufferToWave(audioBuffer, audioBuffer.length);
+      const pureWavFile = new File([wavBlob], "pure_audio.wav", { type: "audio/wav" });
+
+      const formData = new FormData();
+      formData.append("audio_file", pureWavFile);
+
+      const token = localStorage.getItem("token"); 
+      const response = await fetch("http://localhost:5000/api/extract-fingerprint", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${token}` },
+        body: formData,
+      });
+
+      if (!response.ok) throw new Error("Studio engine processing failed.");
+
+      const blob = await response.blob();
+      const processedFile = new File([blob], `Mastered_${audioFile.name}`, { type: "audio/wav" });
+      
+      setAudioFile(processedFile);
+      alert(`✨ Studio Mastering Complete!\nHarsh 'S' sounds and low rumbles have been dynamically removed.`);
+      
+    } catch (error) {
+      console.error(error);
+      alert(`🚨 Audio Engine Error: ${error.message}`);
+    } finally {
+      clearInterval(loadingIntervalRef.current);
+      setIsProcessing(false);
+      setProcessLog("");
+      setSuggestedSilences([]); 
+      setInteractionMode('cut'); 
+      setDeEsserMode('none');
+    }
+  };
+
+  const handleVocalSplit = async () => {
+    if (!audioFile) return;
+    setIsProcessing(true);
+    setProcessLog("🤖 Initializing Meta Demucs AI...");
+
+    let step = 0;
+    loadingIntervalRef.current = setInterval(() => {
+      step++;
+      if(step === 1) setProcessLog("🚀 Sending to Deep Learning Cluster...");
+      if(step === 2) setProcessLog("🪓 Slicing Frequencies (Music vs Voice)...");
+      if(step === 4) setProcessLog("🧬 Running mdx_extra Neural Network...");
+      if(step > 6) setProcessLog("⏳ Extracting Pure Acapella... (Takes a minute)");
+    }, 2000);
+
+try {
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const arrayBuffer = await audioFile.arrayBuffer();
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+      const wavBlob = bufferToWave(audioBuffer, audioBuffer.length);
+      
+      // +++ إغلاق المحرك هنا أيضاً +++
+      audioCtx.close();
+
+      const pureWavFile = new File([wavBlob], "pure_audio.wav", { type: "audio/wav" });
+      const formData = new FormData();
+      formData.append("audio_file", pureWavFile);
+
+      const token = localStorage.getItem("token"); 
+      const response = await fetch("http://localhost:5000/api/split-vocals", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${token}` },
+        body: formData,
+      });
+
+      if (!response.ok) throw new Error("Demucs AI splitting failed.");
+
+      const blob = await response.blob();
+      const processedFile = new File([blob], `Isolated_Vocals_${audioFile.name}`, { type: "audio/wav" });
+      
+      setAudioFile(processedFile);
+      alert(`🎤 Vocals Isolated Successfully!\nAll background music and SFX have been removed.`);
+      
+    } catch (error) {
+      console.error(error);
+      alert(`🚨 AI Engine Error: ${error.message}`);
+    } finally {
       clearInterval(loadingIntervalRef.current);
       setIsProcessing(false);
       setProcessLog("");
@@ -414,7 +500,7 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
           {audioFile && (
             <div className="flex items-center gap-2 mr-4 border-r border-gray-800 pr-4">
               <button onClick={() => downloadAudio()} className="px-3 py-1.5 bg-gray-900 hover:bg-gray-800 border border-gray-700 text-gray-300 text-xs rounded transition-colors">📥 Original</button>
-              {workflowMode === "multi" && (isEnhanced || speed !== 1 || pitch !== 0 || reverbAmount > 0 || isDeEsser) && (
+              {workflowMode === "multi" && (isEnhanced || speed !== 1 || pitch !== 0 || reverbAmount > 0 || deEsserMode !== 'none') && (
                 <button onClick={() => downloadAudio("AI_Mastered")} className="px-3 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-400 font-bold text-xs rounded transition-colors shadow-lg">✨ Export Master track</button>
               )}
             </div>
@@ -438,6 +524,15 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
           </div>
 
           <div className="text-[10px] font-mono uppercase tracking-wider text-gray-600 shrink-0">Neural Audio Tools</div>
+
+          {/* +++ السلاح النووي: زر عزل الصوت عن الموسيقى +++ */}
+          <div className="w-full shrink-0 bg-[#090a0e]/60 border border-indigo-500/20 p-3 rounded-xl flex flex-col gap-3 relative overflow-hidden">
+            <div className="flex items-center gap-3"><span className="text-xl">🪓</span><span className="text-sm font-semibold text-indigo-400">AI Vocal Extractor</span></div>
+            <p className="text-[9px] text-gray-500">Isolate pure voice from anime, music, and SFX using Meta Demucs.</p>
+            <button onClick={handleVocalSplit} disabled={isProcessing} className="w-full mt-2 py-2.5 bg-gradient-to-r from-indigo-600 to-blue-600 hover:from-indigo-500 text-white font-bold text-xs rounded-lg transition-all disabled:opacity-40 shadow-[0_0_15px_rgba(79,70,229,0.3)]">
+              Extract Vocals (Demucs)
+            </button>
+          </div>
           
           <div className="w-full shrink-0 bg-[#0a0a0a] border border-gray-800 p-3 rounded-xl flex flex-col gap-3 relative">
             <div className="flex items-center gap-2"><span className="text-xl">✂️</span><span className="text-sm font-bold text-gray-200">Smart Trimmer</span></div>
@@ -482,15 +577,28 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
               <p className="text-[9px] text-gray-500">EQ & Balanced Compression</p>
             </div>
 
-            <div className={`p-3 rounded-lg border transition-all ${isDeEsser ? 'bg-blue-900/10 border-blue-500/30' : 'bg-[#0a0a0a] border-gray-800'}`}>
-              <div className="flex justify-between items-center mb-1">
-                <span className={`text-xs font-bold ${isDeEsser ? 'text-blue-400' : 'text-gray-400'}`}>🤫 De-Esser (S-Softener)</span>
-                <label className="relative inline-flex items-center cursor-pointer">
-                  <input type="checkbox" className="sr-only peer" checked={isDeEsser} onChange={() => setIsDeEsser(!isDeEsser)} />
-                  <div className="w-7 h-4 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-blue-500"></div>
-                </label>
+            <div className={`p-3 rounded-lg border transition-all ${deEsserMode !== 'none' ? 'bg-blue-900/10 border-blue-500/30' : 'bg-[#0a0a0a] border-gray-800'}`}>
+              <div className="flex justify-between items-center mb-3">
+                <span className={`text-xs font-bold ${deEsserMode !== 'none' ? 'text-blue-400' : 'text-gray-400'}`}>🤫 Sibilance Engine (De-Ess)</span>
               </div>
-              <p className="text-[9px] text-gray-500">Multi-band High Frequency Compression</p>
+              <div className="flex flex-col gap-2">
+                <button
+                  onClick={() => { setDeEsserMode(deEsserMode === 'auto' ? 'none' : 'auto'); setInteractionMode('cut'); }}
+                  className={`py-1.5 rounded text-[10px] font-bold border transition-colors flex items-center justify-center gap-2 ${deEsserMode === 'auto' ? 'bg-blue-600/30 border-blue-500 text-blue-300' : 'bg-black border-gray-800 text-gray-500 hover:border-gray-600'}`}
+                >
+                  🪄 Smart AI Auto-Detect
+                </button>
+                <button
+                  onClick={() => {
+                      const newMode = deEsserMode === 'manual' ? 'none' : 'manual';
+                      setDeEsserMode(newMode);
+                      setInteractionMode(newMode === 'manual' ? 'de_ess' : 'cut');
+                  }}
+                  className={`py-1.5 rounded text-[10px] font-bold border transition-colors flex items-center justify-center gap-2 ${deEsserMode === 'manual' ? 'bg-yellow-600/30 border-yellow-500 text-yellow-300 shadow-[0_0_10px_rgba(234,179,8,0.2)]' : 'bg-black border-gray-800 text-gray-500 hover:border-gray-600'}`}
+                >
+                  🎯 Target Specific 'S' (Print)
+                </button>
+              </div>
             </div>
 
             <div className={`p-3 rounded-lg border transition-all ${pitch !== 0 ? 'bg-purple-900/10 border-purple-500/30' : 'bg-[#0a0a0a] border-gray-800'}`}>
@@ -541,7 +649,7 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
                     onClear={() => { 
                       setAudioFile(null); setCurrentTime(0); setDuration(0); setHistoryIndex(0); 
                       setHistory([{ isSplit: false, isEnhanced: false, transcriptionData: [] }]);
-                      setSpeed(1); setPitch(0); setIsDeEsser(false); setReverbAmount(0); setSuggestedSilences([]); 
+                      setSpeed(1); setPitch(0); setDeEsserMode('none'); setInteractionMode('cut'); setReverbAmount(0); setSuggestedSilences([]); 
                     }} 
                     onTimeUpdate={setCurrentTime}
                     onPlayStateChange={setIsPlaying}
@@ -550,7 +658,9 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
                     isEnhanced={isEnhanced}
                     speed={speed} 
                     pitch={pitch} 
-                    isDeEsser={isDeEsser} 
+                    deEsserMode={deEsserMode}
+                    interactionMode={interactionMode}
+                    onExtractFingerprint={handleExtractFingerprint}
                     reverbAmount={reverbAmount}
                     suggestedSilences={suggestedSilences} 
                     onApplyManualCuts={handleManualCuts}
