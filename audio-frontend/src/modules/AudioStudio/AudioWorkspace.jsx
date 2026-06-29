@@ -63,6 +63,8 @@ const applyCutsToAudio = async (file, keptRegions) => {
 
 export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user, setUser }) { 
   const [audioFile, setAudioFile] = useState(null); 
+  const [isolatedVocals, setIsolatedVocals] = useState(null);
+  const [isolatedBackground, setIsolatedBackground] = useState(null);
   const [currentTime, setCurrentTime] = useState(0); 
   const [isPlaying, setIsPlaying] = useState(false); 
   const [duration, setDuration] = useState(0);
@@ -90,7 +92,7 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
   const [reverbAmount, setReverbAmount] = useState(0); 
 
   const [workflowMode, setWorkflowMode] = useState("multi");
-  
+  const [extractionQuality, setExtractionQuality] = useState("fast"); // +++ حالة الجودة
   const loadingIntervalRef = useRef(null);
 
   useEffect(() => {
@@ -240,6 +242,8 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
 
   const handleFileReceived = (file) => {
     setAudioFile(file);
+    setIsolatedVocals(null);     // +++ تصفير
+    setIsolatedBackground(null); // +++ تصفير
     setHistory([{ isSplit: false, isEnhanced: false, transcriptionData: [] }]);
     setHistoryIndex(0);
   };
@@ -363,58 +367,84 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
     }
   };
 
-  const handleVocalSplit = async () => {
+
+
+const handleVocalSplit = async () => {
     if (!audioFile) return;
     setIsProcessing(true);
-    setProcessLog("🤖 Initializing Meta Demucs AI...");
+    setProcessLog("🚀 Uploading to Node.js Server...");
 
-    let step = 0;
-    loadingIntervalRef.current = setInterval(() => {
-      step++;
-      if(step === 1) setProcessLog("🚀 Sending to Deep Learning Cluster...");
-      if(step === 2) setProcessLog("🪓 Slicing Frequencies (Music vs Voice)...");
-      if(step === 4) setProcessLog("🧬 Running mdx_extra Neural Network...");
-      if(step > 6) setProcessLog("⏳ Extracting Pure Acapella... (Takes a minute)");
-    }, 2000);
+    try {
+        const formData = new FormData();
+        formData.append("audio_file", audioFile);
+        formData.append("quality", extractionQuality); // +++ إرسال الجودة التي اختارها المستخدم
+        const token = localStorage.getItem("token");
+        
+        const startResponse = await fetch("http://localhost:5000/api/split-vocals/start", {
+            method: "POST", headers: { "Authorization": `Bearer ${token}` }, body: formData,
+        });
 
-try {
-      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      const arrayBuffer = await audioFile.arrayBuffer();
-      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-      const wavBlob = bufferToWave(audioBuffer, audioBuffer.length);
-      
-      // +++ إغلاق المحرك هنا أيضاً +++
-      audioCtx.close();
+        if (!startResponse.ok) throw new Error("AI engine failed to start.");
+        const startData = await startResponse.json();
 
-      const pureWavFile = new File([wavBlob], "pure_audio.wav", { type: "audio/wav" });
-      const formData = new FormData();
-      formData.append("audio_file", pureWavFile);
+              setProcessLog(extractionQuality === "studio" ? "⏳ Studio Mode: Rendering HD Stems... (~6 mins)" : "⏳ Fast Mode: Extracting Stems... (~1 min)");
+        const checkStatus = async () => {
+            try {
+                const statusResponse = await fetch(`http://localhost:5000/api/split-vocals/status/${startData.jobId}`, {
+                    headers: { "Authorization": `Bearer ${token}` }
+                });
+                const statusData = await statusResponse.json();
 
-      const token = localStorage.getItem("token"); 
-      const response = await fetch("http://localhost:5000/api/split-vocals", {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${token}` },
-        body: formData,
-      });
-
-      if (!response.ok) throw new Error("Demucs AI splitting failed.");
-
-      const blob = await response.blob();
-      const processedFile = new File([blob], `Isolated_Vocals_${audioFile.name}`, { type: "audio/wav" });
-      
-      setAudioFile(processedFile);
-      alert(`🎤 Vocals Isolated Successfully!\nAll background music and SFX have been removed.`);
-      
+                if (statusData.status === 'succeeded') {
+                    setProcessLog("📥 Downloading Vocals and Music tracks...");
+                    
+                    // ✅ طلب الملفين بشكل متزامن
+                    const [vocalsRes, bgRes] = await Promise.all([
+                        fetch(`http://localhost:5000/api/split-vocals/download/${startData.jobId}/vocals`, { headers: { "Authorization": `Bearer ${token}` } }),
+                        fetch(`http://localhost:5000/api/split-vocals/download/${startData.jobId}/background`, { headers: { "Authorization": `Bearer ${token}` } })
+                    ]);
+                    
+                    if (!vocalsRes.ok || !bgRes.ok) throw new Error("Download failed.");
+                    
+                    setProcessLog("⚙️ Finalizing audio tracks...");
+                    
+                    const vocalsBlob = await vocalsRes.blob();
+                    const bgBlob = await bgRes.blob();
+                    
+                    const vocalsFileObj = new File([vocalsBlob], `Vocals_${audioFile.name}.mp3`, { type: "audio/mpeg" });
+                    const bgFileObj = new File([bgBlob], `Music_${audioFile.name}.mp3`, { type: "audio/mpeg" });
+                    
+                    // ✅ حفظ المسارات في الـ State دون حذف الملف الأصلي!
+                    setIsolatedVocals(vocalsFileObj);
+                    setIsolatedBackground(bgFileObj);
+                    
+                    setIsProcessing(false);
+                    setProcessLog("");
+                    alert(`🎤🎹 Success! Vocals and Music isolated successfully!`);
+                    
+                } else if (statusData.status === 'failed') {
+                    throw new Error(statusData.error || "AI processing failed internally.");
+                } else {
+                    setProcessLog(`⚙️ GPU Status: Extracting Multi-Stems...`);
+                    setTimeout(checkStatus, 3000);
+                }
+            } catch (err) {
+                console.error(err);
+                alert(`🚨 Monitoring Error: ${err.message}`);
+                setIsProcessing(false);
+                setProcessLog("");
+            }
+        };
+        setTimeout(checkStatus, 3000);
     } catch (error) {
-      console.error(error);
-      alert(`🚨 AI Engine Error: ${error.message}`);
-    } finally {
-      clearInterval(loadingIntervalRef.current);
-      setIsProcessing(false);
-      setProcessLog("");
+        console.error(error);
+        alert(`🚨 Local Engine Error: ${error.message}`);
+        setIsProcessing(false);
+        setProcessLog("");
     }
   };
 
+  
   const handleWaveformReady = () => {
     if (isProcessing) {
       clearInterval(loadingIntervalRef.current);
@@ -465,7 +495,8 @@ try {
   };
 
   const hasTranscriptData = transcriptionData && transcriptionData.length > 0;
-        
+  // +++ درع حماية الشاشة السوداء (يمنع تمرير قيم غير معروفة للموجات) +++
+const safeSeekToTime = (seekToTime !== null && Number.isFinite(seekToTime)) ? seekToTime : null;
   return (
     <div className="h-screen w-full bg-[#030303] text-gray-200 flex flex-col overflow-hidden font-sans select-none">
       
@@ -524,13 +555,22 @@ try {
           </div>
 
           <div className="text-[10px] font-mono uppercase tracking-wider text-gray-600 shrink-0">Neural Audio Tools</div>
-
-          {/* +++ السلاح النووي: زر عزل الصوت عن الموسيقى +++ */}
+{/* أداة عزل الصوت والموسيقى - مع خيار الجودة */}
           <div className="w-full shrink-0 bg-[#090a0e]/60 border border-indigo-500/20 p-3 rounded-xl flex flex-col gap-3 relative overflow-hidden">
-            <div className="flex items-center gap-3"><span className="text-xl">🪓</span><span className="text-sm font-semibold text-indigo-400">AI Vocal Extractor</span></div>
-            <p className="text-[9px] text-gray-500">Isolate pure voice from anime, music, and SFX using Meta Demucs.</p>
-            <button onClick={handleVocalSplit} disabled={isProcessing} className="w-full mt-2 py-2.5 bg-gradient-to-r from-indigo-600 to-blue-600 hover:from-indigo-500 text-white font-bold text-xs rounded-lg transition-all disabled:opacity-40 shadow-[0_0_15px_rgba(79,70,229,0.3)]">
-              Extract Vocals (Demucs)
+            <div className="flex items-center gap-3"><span className="text-xl">🪓</span><span className="text-sm font-semibold text-indigo-400">Multi-Stem Extractor</span></div>
+            
+            {/* +++ القائمة المنسدلة لاختيار الجودة +++ */}
+            <select 
+              value={extractionQuality} 
+              onChange={(e) => setExtractionQuality(e.target.value)} 
+              className="bg-[#040404] border border-gray-700 text-xs rounded-lg p-2 text-indigo-300 outline-none focus:border-indigo-500 transition-colors"
+            >
+              <option value="fast">⚡ Fast Mode (~1-2 mins)</option>
+              <option value="studio">🎧 Studio Quality (~6 mins)</option>
+            </select>
+
+            <button onClick={handleVocalSplit} disabled={isProcessing} className="w-full mt-1 py-2.5 bg-gradient-to-r from-indigo-600 to-blue-600 hover:from-indigo-500 text-white font-bold text-xs rounded-lg transition-all disabled:opacity-40 shadow-[0_0_15px_rgba(79,70,229,0.3)]">
+              Extract Vocals & Music
             </button>
           </div>
           
@@ -561,6 +601,7 @@ try {
             <button onClick={handleTranscribeWithAPI} disabled={isProcessing} className="w-full mt-2 py-2.5 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 text-white font-bold text-xs rounded-lg transition-all disabled:opacity-40">Fetch API Transcript</button>
           </div>
 
+          {/* لوحة الـ FX Rack الأصلية التي تحبها */}
           <div className="w-full shrink-0 bg-[#070707] border border-gray-800 p-4 rounded-xl flex flex-col gap-4 relative overflow-hidden shadow-inner">
             <div className="text-[10px] font-mono uppercase tracking-wider text-emerald-500 mb-1 flex items-center justify-between">
               <span className="flex items-center gap-2"><span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></span>Active FX Rack</span>
@@ -582,22 +623,8 @@ try {
                 <span className={`text-xs font-bold ${deEsserMode !== 'none' ? 'text-blue-400' : 'text-gray-400'}`}>🤫 Sibilance Engine (De-Ess)</span>
               </div>
               <div className="flex flex-col gap-2">
-                <button
-                  onClick={() => { setDeEsserMode(deEsserMode === 'auto' ? 'none' : 'auto'); setInteractionMode('cut'); }}
-                  className={`py-1.5 rounded text-[10px] font-bold border transition-colors flex items-center justify-center gap-2 ${deEsserMode === 'auto' ? 'bg-blue-600/30 border-blue-500 text-blue-300' : 'bg-black border-gray-800 text-gray-500 hover:border-gray-600'}`}
-                >
-                  🪄 Smart AI Auto-Detect
-                </button>
-                <button
-                  onClick={() => {
-                      const newMode = deEsserMode === 'manual' ? 'none' : 'manual';
-                      setDeEsserMode(newMode);
-                      setInteractionMode(newMode === 'manual' ? 'de_ess' : 'cut');
-                  }}
-                  className={`py-1.5 rounded text-[10px] font-bold border transition-colors flex items-center justify-center gap-2 ${deEsserMode === 'manual' ? 'bg-yellow-600/30 border-yellow-500 text-yellow-300 shadow-[0_0_10px_rgba(234,179,8,0.2)]' : 'bg-black border-gray-800 text-gray-500 hover:border-gray-600'}`}
-                >
-                  🎯 Target Specific 'S' (Print)
-                </button>
+                <button onClick={() => { setDeEsserMode(deEsserMode === 'auto' ? 'none' : 'auto'); setInteractionMode('cut'); }} className={`py-1.5 rounded text-[10px] font-bold border transition-colors flex items-center justify-center gap-2 ${deEsserMode === 'auto' ? 'bg-blue-600/30 border-blue-500 text-blue-300' : 'bg-black border-gray-800 text-gray-500 hover:border-gray-600'}`}>🪄 Smart AI Auto-Detect</button>
+                <button onClick={() => { const newMode = deEsserMode === 'manual' ? 'none' : 'manual'; setDeEsserMode(newMode); setInteractionMode(newMode === 'manual' ? 'de_ess' : 'cut'); }} className={`py-1.5 rounded text-[10px] font-bold border transition-colors flex items-center justify-center gap-2 ${deEsserMode === 'manual' ? 'bg-yellow-600/30 border-yellow-500 text-yellow-300 shadow-[0_0_10px_rgba(234,179,8,0.2)]' : 'bg-black border-gray-800 text-gray-500 hover:border-gray-600'}`}>🎯 Target Specific 'S' (Print)</button>
               </div>
             </div>
 
@@ -607,11 +634,6 @@ try {
                 <span className="text-xs font-mono bg-black px-1.5 rounded text-gray-400">{pitch > 0 ? `+${pitch}` : pitch} st</span>
               </div>
               <input type="range" min="-12" max="12" step="1" value={pitch} onChange={(e) => setPitch(parseInt(e.target.value))} className="w-full h-1 bg-gray-800 rounded-lg appearance-none cursor-pointer accent-purple-500" />
-              <div className="flex justify-between text-[8px] text-gray-500 font-mono mt-1">
-                <button onClick={() => setPitch(-4)} className="hover:text-purple-400">Deep</button>
-                <button onClick={() => setPitch(0)} className="hover:text-gray-300">Normal</button>
-                <button onClick={() => setPitch(4)} className="hover:text-purple-400">Thin</button>
-              </div>
             </div>
 
             <div className={`p-3 rounded-lg border transition-all ${speed !== 1 ? 'bg-amber-900/10 border-amber-500/30' : 'bg-[#0a0a0a] border-gray-800'}`}>
@@ -620,11 +642,6 @@ try {
                 <span className="text-xs font-mono bg-black px-1.5 rounded text-gray-400">{speed.toFixed(2)}x</span>
               </div>
               <input type="range" min="0.5" max="2" step="0.1" value={speed} onChange={(e) => setSpeed(parseFloat(e.target.value))} className="w-full h-1 bg-gray-800 rounded-lg appearance-none cursor-pointer accent-amber-500" />
-              <div className="flex justify-between text-[8px] text-gray-500 font-mono mt-1">
-                <button onClick={() => setSpeed(0.5)} className="hover:text-amber-400">Slow</button>
-                <button onClick={() => setSpeed(1)} className="hover:text-gray-300">1.0x</button>
-                <button onClick={() => setSpeed(2)} className="hover:text-amber-400">Fast</button>
-              </div>
             </div>
 
             <div className={`p-3 rounded-lg border transition-all ${reverbAmount > 0 ? 'bg-cyan-900/10 border-cyan-500/30' : 'bg-[#0a0a0a] border-gray-800'}`}>
@@ -637,44 +654,117 @@ try {
           </div>
         </aside>
 
-        <main className="flex-1 bg-[#040404] p-6 flex flex-row items-center justify-center relative min-w-0 z-10 shadow-2xl gap-6 overflow-hidden">
+          <main className="flex-1 bg-[#040404] p-6 flex flex-row items-center justify-center relative min-w-0 z-10 shadow-2xl gap-6 overflow-hidden">
           {(!audioFile && !hasTranscriptData) ? ( 
             <SmartDropzone onFileDrop={handleFileReceived} /> 
           ) : (
             <>
-              <div className="flex-1 flex flex-col items-center justify-center w-full max-w-5xl h-full">
-                {audioFile ? (
-                  <StudioWaveform 
-                    file={audioFile} 
-                    onClear={() => { 
-                      setAudioFile(null); setCurrentTime(0); setDuration(0); setHistoryIndex(0); 
-                      setHistory([{ isSplit: false, isEnhanced: false, transcriptionData: [] }]);
-                      setSpeed(1); setPitch(0); setDeEsserMode('none'); setInteractionMode('cut'); setReverbAmount(0); setSuggestedSilences([]); 
-                    }} 
-                    onTimeUpdate={setCurrentTime}
-                    onPlayStateChange={setIsPlaying}
-                    onDurationChange={setDuration}
-                    seekToTime={seekToTime} 
-                    isEnhanced={isEnhanced}
-                    speed={speed} 
-                    pitch={pitch} 
-                    deEsserMode={deEsserMode}
-                    interactionMode={interactionMode}
-                    onExtractFingerprint={handleExtractFingerprint}
-                    reverbAmount={reverbAmount}
-                    suggestedSilences={suggestedSilences} 
-                    onApplyManualCuts={handleManualCuts}
-                    isProcessing={isProcessing}
-                    processLog={processLog}
-                    onReady={handleWaveformReady}
-                  />
-                ) : (
-                  <div className="w-full max-w-2xl p-12 border-2 border-dashed border-gray-800 rounded-3xl flex flex-col items-center justify-center bg-gray-900/10 backdrop-blur-sm">
-                    <div className="w-20 h-20 bg-emerald-500/10 rounded-full flex items-center justify-center mb-6"><span>☁️</span></div>
-                    <h3 className="text-xl font-bold text-gray-200 mb-2">Transcript Loaded Successfully</h3>
-                    <p className="text-gray-500 text-sm max-w-md text-center leading-relaxed">Your AI translations and texts have been securely loaded from the database.</p>
+              {/* واجهة عرض المسارات المتعددة */}
+              <div className="flex-1 flex flex-col w-full max-w-5xl h-full gap-5 overflow-y-auto pr-2" style={{ scrollbarWidth: 'thin', scrollbarColor: '#333 transparent' }}>
+                
+                {/* 1. المسار الأصلي (Master Track) */}
+                {audioFile && (
+                  <div className="bg-[#0a0a0a] rounded-2xl border border-gray-800 p-4 shadow-lg shrink-0 flex flex-col">
+                    <div className="flex items-center justify-between mb-3 border-b border-gray-800 pb-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-emerald-400 text-lg">💿</span>
+                        <h3 className="text-sm font-bold text-gray-200 uppercase tracking-wider">Master Track (Original)</h3>
+                      </div>
+                    </div>
+                    <StudioWaveform 
+                      file={audioFile} 
+                      onClear={() => { 
+                        setAudioFile(null); setIsolatedVocals(null); setIsolatedBackground(null);
+                        setCurrentTime(0); setDuration(0); setHistoryIndex(0); 
+                        setHistory([{ isSplit: false, isEnhanced: false, transcriptionData: [] }]);
+                        setSpeed(1); setPitch(0); setDeEsserMode('none'); setInteractionMode('cut'); setReverbAmount(0); setSuggestedSilences([]);
+                      }} 
+                      onTimeUpdate={setCurrentTime} 
+                      onPlayStateChange={setIsPlaying} 
+                      onDurationChange={setDuration} 
+                      seekToTime={safeSeekToTime} 
+                      isEnhanced={isEnhanced} 
+                      speed={speed} 
+                      pitch={pitch} 
+                      deEsserMode={deEsserMode} 
+                      interactionMode={interactionMode} 
+                      onExtractFingerprint={handleExtractFingerprint} 
+                      reverbAmount={reverbAmount} 
+                      suggestedSilences={suggestedSilences} 
+                      onApplyManualCuts={handleManualCuts} 
+                      isProcessing={isProcessing} 
+                      processLog={processLog} 
+                      onReady={handleWaveformReady}
+                    />
                   </div>
                 )}
+
+                {/* 2. مسار الصوت البشري (Vocals) - تم إصلاح المشكلة وتمرير الخصائص المفقودة */}
+                {isolatedVocals && (
+                  <div className="bg-indigo-900/10 rounded-2xl border border-indigo-500/20 p-4 shadow-lg shrink-0 animate-fade-in flex flex-col">
+                    <div className="flex items-center justify-between mb-3 border-b border-indigo-500/20 pb-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-indigo-400 text-lg">🎤</span>
+                        <h3 className="text-sm font-bold text-indigo-300 uppercase tracking-wider">Isolated Vocals</h3>
+                      </div>
+                      <button onClick={() => setIsolatedVocals(null)} className="text-xs text-indigo-400 hover:text-white transition-colors bg-indigo-500/10 px-2 py-1 rounded">✕ Hide</button>
+                    </div>
+                    <StudioWaveform 
+                      file={isolatedVocals} 
+                      onClear={() => setIsolatedVocals(null)} 
+                      onTimeUpdate={() => {}} 
+                      onPlayStateChange={() => {}} 
+                      onDurationChange={() => {}} 
+                      seekToTime={safeSeekToTime} /* +++ هذه هي الخاصية التي كانت مفقودة وسببت الشاشة السوداء +++ */
+                      isEnhanced={false} 
+                      speed={speed} 
+                      pitch={0} 
+                      deEsserMode={'none'} 
+                      interactionMode={'cut'} 
+                      onExtractFingerprint={() => {}} 
+                      reverbAmount={0} 
+                      suggestedSilences={[]} 
+                      onApplyManualCuts={() => {}} 
+                      isProcessing={false} 
+                      processLog={""} 
+                      onReady={() => {}}
+                    />
+                  </div>
+                )}
+
+                {/* 3. مسار الموسيقى (Background) - تم إصلاح المشكلة وتمرير الخصائص المفقودة */}
+                {isolatedBackground && (
+                  <div className="bg-purple-900/10 rounded-2xl border border-purple-500/20 p-4 shadow-lg shrink-0 animate-fade-in flex flex-col">
+                    <div className="flex items-center justify-between mb-3 border-b border-purple-500/20 pb-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-purple-400 text-lg">🎹</span>
+                        <h3 className="text-sm font-bold text-purple-300 uppercase tracking-wider">Instrumental & Effects</h3>
+                      </div>
+                      <button onClick={() => setIsolatedBackground(null)} className="text-xs text-purple-400 hover:text-white transition-colors bg-purple-500/10 px-2 py-1 rounded">✕ Hide</button>
+                    </div>
+                    <StudioWaveform 
+                      file={isolatedBackground} 
+                      onClear={() => setIsolatedBackground(null)} 
+                      onTimeUpdate={() => {}} 
+                      onPlayStateChange={() => {}} 
+                      onDurationChange={() => {}} 
+                      seekToTime={safeSeekToTime} /* +++ هذه هي الخاصية التي كانت مفقودة وسببت الشاشة السوداء +++ */
+                      isEnhanced={false} 
+                      speed={speed} 
+                      pitch={0} 
+                      deEsserMode={'none'} 
+                      interactionMode={'cut'} 
+                      onExtractFingerprint={() => {}} 
+                      reverbAmount={0} 
+                      suggestedSilences={[]} 
+                      onApplyManualCuts={() => {}} 
+                      isProcessing={false} 
+                      processLog={""} 
+                      onReady={() => {}}
+                    />
+                  </div>
+                )}
+                
               </div>
 
               {hasTranscriptData && (

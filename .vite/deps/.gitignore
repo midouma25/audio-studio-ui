@@ -1,0 +1,16 @@
+# Node.js dependencies
+node_modules
+
+# Python Virtual Environments
+.venv
+venv
+env
+__pycache__
+
+# Uploads & AI Output Folders
+uploads/
+Public_*/
+Demucs_*/
+
+# Environment Variables (لحماية كلمات المرور الخاصة بك)
+.env
