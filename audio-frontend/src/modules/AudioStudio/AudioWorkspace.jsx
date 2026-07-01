@@ -24,44 +24,11 @@ function bufferToWave(abuffer, len) {
   }
   return new Blob([buffer], {type: "audio/wav"});
 }
-const applyCutsToAudio = async (file, keptRegions) => {
-  try {
-    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const arrayBuffer = await file.arrayBuffer();
-    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-
-    let newDuration = 0;
-    const validRegions = keptRegions.map(region => {
-      const start = Math.max(0, Math.min(region.start, audioBuffer.duration));
-      const end = Math.max(0, Math.min(region.end, audioBuffer.duration));
-      newDuration += (end - start);
-      return { start, end, duration: end - start };
-    }).filter(r => r.duration > 0.01); 
-
-    if (newDuration <= 0) throw new Error("Trimmed duration is 0");
-
-    const totalFrames = Math.max(1, Math.ceil(audioCtx.sampleRate * newDuration));
-    const offlineCtx = new OfflineAudioContext(audioBuffer.numberOfChannels, totalFrames, audioCtx.sampleRate);
-
-    let currentTimeOffset = 0;
-    validRegions.forEach(region => {
-      const source = offlineCtx.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(offlineCtx.destination);
-      source.start(currentTimeOffset, region.start, region.duration);
-      currentTimeOffset += region.duration;
-    });
-
-    const renderedBuffer = await offlineCtx.startRendering();
-    const blob = bufferToWave(renderedBuffer, renderedBuffer.length);
-    return new File([blob], `Trimmed_${Date.now()}.wav`, { type: "audio/wav" });
-  } catch (error) {
-    throw error; 
-  }
-};
 
 export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user, setUser }) { 
-  const [previewGap, setPreviewGap] = useState(null); // حالة المعاينة الجديدة
+ 
+  const [showTrimmerGuide, setShowTrimmerGuide] = useState(false); // +++ حالة لفتح وإغلاق الخريطة الإرشادية
+  const [playbackCommand, setPlaybackCommand] = useState(null); // +++ نظام الأوامر الجديد
   const [audioFile, setAudioFile] = useState(null); 
   const [isolatedVocals, setIsolatedVocals] = useState(null);
   const [isolatedBackground, setIsolatedBackground] = useState(null);
@@ -71,8 +38,6 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
   const [seekToTime, setSeekToTime] = useState(null);
   const [timelineHeight, setTimelineHeight] = useState(288); 
    
-  const [previewingIndex, setPreviewingIndex] = useState(null);
-
   const [history, setHistory] = useState([{ isSplit: false, isEnhanced: false, transcriptionData: [] }]);
   const [historyIndex, setHistoryIndex] = useState(0);
   const currentState = history[historyIndex];
@@ -94,7 +59,7 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
   const [reverbAmount, setReverbAmount] = useState(0); 
 
   const [workflowMode, setWorkflowMode] = useState("multi");
-  const [extractionQuality, setExtractionQuality] = useState("fast"); // +++ حالة الجودة
+  const [extractionQuality, setExtractionQuality] = useState("fast"); 
   const loadingIntervalRef = useRef(null);
 
   useEffect(() => {
@@ -244,19 +209,15 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
 
   const handleFileReceived = (file) => {
     setAudioFile(file);
-    setIsolatedVocals(null);     // +++ تصفير
-    setIsolatedBackground(null); // +++ تصفير
+    setIsolatedVocals(null); 
+    setIsolatedBackground(null); 
     setHistory([{ isSplit: false, isEnhanced: false, transcriptionData: [] }]);
     setHistoryIndex(0);
   };
 
-
-
-// +++ كاشف الفراغات الهجين مع "هوامش الأمان" والتنظيم الذكي +++
   const handleDetectSilencesVisually = async () => {
     if (!audioFile) return alert("⚠️ Please load an audio file first!");
     
-    // +++ نظام الحماية الذكي: توجيه المستخدم إذا اختار "صوت مع موسيقى" ولم يعزل الصوت +++
     if (trimmerMode === "mixed_audio" && !isolatedVocals && !hasTranscriptData) {
       alert("🛑 For Mixed Audio (Speech + Music), the scanner needs pure voice to be accurate!\n\nPlease use the 'Extract Vocals & Music' button above first, or fetch a Transcript.");
       return; 
@@ -266,7 +227,7 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
     
     try {
       let silences = [];
-      const padding = 0.2; // ⏱️ هامش الأمان: 200 مللي ثانية لحماية أطراف الكلمات
+      const padding = 0.2; 
       
       if (hasTranscriptData) {
         setProcessLog(`🧠 AI Vision: Reading speech gaps from Cloud Transcript...`);
@@ -293,7 +254,6 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
         }
         
       } else {
-        // +++ تحديد الملف المراد فحصه بذكاء +++
         const targetFileToScan = (trimmerMode === "mixed_audio" && isolatedVocals) ? isolatedVocals : audioFile;
         
         setProcessLog(targetFileToScan === isolatedVocals 
@@ -309,7 +269,6 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
         let isSilent = false;
         let silenceStart = 0;
         const step = Math.floor(sampleRate * 0.1); 
-        // تغيير الحساسية: الصوت النقي يحتاج حساسية مختلفة عن الصوت المعزول
         const threshold = trimmerMode === "pure_voice" ? 0.05 : 0.02; 
 
         for (let i = 0; i < channelData.length; i += step) {
@@ -352,11 +311,82 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
       setProcessLog("");
     }
   };
+// +++ دالة قص علامة حمراء واحدة فقط (مع خوارزمية الإزاحة الزمنية لكي لا تختفي القائمة) +++
+  const handleCutSingleGap = async (gapToCut, idx) => {
+    // نحتفظ بما قبل العلامة، وما بعد العلامة
+    const keptRegions = [
+      { start: 0, end: gapToCut.start },
+      { start: gapToCut.end, end: duration }
+    ];
+    
+    if (!audioFile) return;
+    setIsProcessing(true);
+    setProcessLog("✂️ Cutting single gap and syncing timeline...");
 
+    try {
+      const formData = new FormData();
+      formData.append("audio_file", audioFile);
+      formData.append("keptRegions", JSON.stringify(keptRegions));
 
+      const token = localStorage.getItem("token"); 
+      const response = await fetch("http://localhost:5000/api/trim-audio", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${token}` },
+        body: formData,
+      });
 
+      if (!response.ok) throw new Error("FFmpeg trimming failed on server.");
 
-const handleManualCuts = async (keptRegions) => {
+      const blob = await response.blob();
+      const trimmedAudioFile = new File([blob], `Trimmed_${audioFile.name}`, { type: "audio/mpeg" });
+      
+      setAudioFile(trimmedAudioFile);
+      
+      // 🪄 السحر الرياضي: تحديث أوقات الفراغات المتبقية لكي لا تختفي القائمة
+      const cutDuration = gapToCut.end - gapToCut.start; // مدة المقطع الذي تم حذفه
+      const newSilences = suggestedSilences
+        .filter((_, i) => i !== idx) // نحذف العلامة التي قصيناها من القائمة
+        .map(gap => {
+          // إذا كانت العلامة المتبقية تأتي بعد العلامة المحذوفة، نزيل منها وقت الحذف لترجع لليسار
+          if (gap.start >= gapToCut.end) {
+            return { start: gap.start - cutDuration, end: gap.end - cutDuration };
+          }
+          return gap; // إذا كانت قبلها، تبقى كما هي
+        });
+      
+      setSuggestedSilences(newSilences); // نحدث القائمة بدلاً من تفريغها!
+      setPlaybackCommand(null);
+
+    } catch (error) {
+      console.error(error);
+      alert(`🚨 Audio Engine Error: ${error.message}`);
+    } finally {
+      setIsProcessing(false);
+      setProcessLog("");
+    }
+  };
+
+  // +++ دالة تنفيذ كل القصات دفعة واحدة (تم إصلاحها لتعمل بدقة) +++
+  const executeAllSuggestedCuts = () => {
+    let kept = [];
+    let currentStart = 0;
+    // ترتيب الفراغات زمنياً لضمان عدم حدوث أخطاء
+    const sortedCuts = [...suggestedSilences].sort((a, b) => a.start - b.start);
+    
+    for (let cut of sortedCuts) {
+        if (cut.start > currentStart) {
+            kept.push({ start: currentStart, end: cut.start });
+        }
+        currentStart = Math.max(currentStart, cut.end);
+    }
+    if (currentStart < duration) {
+        kept.push({ start: currentStart, end: duration });
+    }
+    
+    handleManualCuts(kept); // نرسل المناطق المحتفظ بها للمقص
+  };
+  
+  const handleManualCuts = async (keptRegions) => {
     if (!audioFile || !keptRegions || keptRegions.length === 0) return;
     setIsProcessing(true);
     setProcessLog("✂️ Uploading to FFmpeg Engine for perfect trimming...");
@@ -364,7 +394,7 @@ const handleManualCuts = async (keptRegions) => {
     try {
       const formData = new FormData();
       formData.append("audio_file", audioFile);
-      formData.append("keptRegions", JSON.stringify(keptRegions)); // إرسال المناطق التي نريد الاحتفاظ بها
+      formData.append("keptRegions", JSON.stringify(keptRegions)); 
 
       const token = localStorage.getItem("token"); 
       const response = await fetch("http://localhost:5000/api/trim-audio", {
@@ -378,10 +408,10 @@ const handleManualCuts = async (keptRegions) => {
       setProcessLog("📥 Downloading the perfectly trimmed audio...");
       
       const blob = await response.blob();
-      const trimmedAudioFile = new File([blob], `Trimmed_${audioFile.name}.mp3`, { type: "audio/mpeg" });
+      const trimmedAudioFile = new File([blob], `Trimmed_${audioFile.name}`, { type: "audio/mpeg" });
       
       setAudioFile(trimmedAudioFile);
-      setSuggestedSilences([]); // مسح التظليلات بعد النجاح
+      setSuggestedSilences([]); // مسح التظليلات بعد النجاح الكلي فقط
       alert("✂️ Success! Audio perfectly trimmed without freezing.");
 
     } catch (error) {
@@ -393,21 +423,20 @@ const handleManualCuts = async (keptRegions) => {
     }
   };
 
-  const handleExtractFingerprint = async () => {
+// +++ الاستئصال الجراحي لحرف الـ S (Surgical De-Esser) +++
+  const handleExtractFingerprint = async (targetRegion = null) => {
     if (!audioFile) return;
-    setIsProcessing(true);
-    setProcessLog("🎛️ Initializing Studio Engine...");
+    
+    // حماية: إذا كان المستخدم في الوضع اليدوي ولم يرسم مربعاً أصفر
+    if (deEsserMode === 'manual' && !targetRegion) {
+        return alert("⚠️ Please draw a YELLOW box over the bad 'S' sound first!");
+    }
 
-    let step = 0;
-    loadingIntervalRef.current = setInterval(() => {
-      step++;
-      if(step === 1) setProcessLog("🔄 Transcoding to Pure WAV...");
-      if(step === 2) setProcessLog("🎚️ Applying Dynamic Multiband Compressor...");
-      if(step === 3) setProcessLog("🤫 Suppressing Sibilance ('S' sounds)...");
-      if(step > 3) setProcessLog("✨ Rendering Final Master...");
-    }, 800);
+    setIsProcessing(true);
+    setProcessLog(targetRegion ? "🎯 Surgically removing 'S' from selected timeframe..." : "🪄 Applying Smart Auto De-Esser...");
 
     try {
+      // 1. تحويل الملف إلى WAV نقي لمنع فقدان الجودة
       const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       const arrayBuffer = await audioFile.arrayBuffer();
       const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
@@ -417,6 +446,11 @@ const handleManualCuts = async (keptRegions) => {
 
       const formData = new FormData();
       formData.append("audio_file", pureWavFile);
+      
+      // 2. إرسال إحداثيات المربع الأصفر (إن وُجدت) للسيرفر
+      if (targetRegion) {
+          formData.append("targetRegion", JSON.stringify(targetRegion));
+      }
 
       const token = localStorage.getItem("token"); 
       const response = await fetch("http://localhost:5000/api/extract-fingerprint", {
@@ -428,16 +462,15 @@ const handleManualCuts = async (keptRegions) => {
       if (!response.ok) throw new Error("Studio engine processing failed.");
 
       const blob = await response.blob();
-      const processedFile = new File([blob], `Mastered_${audioFile.name}`, { type: "audio/wav" });
+      const processedFile = new File([blob], `DeEssed_${audioFile.name}`, { type: "audio/wav" });
       
       setAudioFile(processedFile);
-      alert(`✨ Studio Mastering Complete!\nHarsh 'S' sounds and low rumbles have been dynamically removed.`);
+      alert(targetRegion ? `🎯 Surgical Strike Complete! The harsh 'S' has been eliminated.` : `🪄 Auto De-Esser Applied!`);
       
     } catch (error) {
       console.error(error);
       alert(`🚨 Audio Engine Error: ${error.message}`);
     } finally {
-      clearInterval(loadingIntervalRef.current);
       setIsProcessing(false);
       setProcessLog("");
       setSuggestedSilences([]); 
@@ -446,9 +479,8 @@ const handleManualCuts = async (keptRegions) => {
     }
   };
 
-
-
-const handleVocalSplit = async () => {
+  
+  const handleVocalSplit = async () => {
     if (!audioFile) return;
     setIsProcessing(true);
     setProcessLog("🚀 Uploading to Node.js Server...");
@@ -456,7 +488,7 @@ const handleVocalSplit = async () => {
     try {
         const formData = new FormData();
         formData.append("audio_file", audioFile);
-        formData.append("quality", extractionQuality); // +++ إرسال الجودة التي اختارها المستخدم
+        formData.append("quality", extractionQuality);
         const token = localStorage.getItem("token");
         
         const startResponse = await fetch("http://localhost:5000/api/split-vocals/start", {
@@ -466,7 +498,7 @@ const handleVocalSplit = async () => {
         if (!startResponse.ok) throw new Error("AI engine failed to start.");
         const startData = await startResponse.json();
 
-              setProcessLog(extractionQuality === "studio" ? "⏳ Studio Mode: Rendering HD Stems... (~6 mins)" : "⏳ Fast Mode: Extracting Stems... (~1 min)");
+        setProcessLog(extractionQuality === "studio" ? "⏳ Studio Mode: Rendering HD Stems... (~6 mins)" : "⏳ Fast Mode: Extracting Stems... (~1 min)");
         const checkStatus = async () => {
             try {
                 const statusResponse = await fetch(`http://localhost:5000/api/split-vocals/status/${startData.jobId}`, {
@@ -477,7 +509,6 @@ const handleVocalSplit = async () => {
                 if (statusData.status === 'succeeded') {
                     setProcessLog("📥 Downloading Vocals and Music tracks...");
                     
-                    // ✅ طلب الملفين بشكل متزامن
                     const [vocalsRes, bgRes] = await Promise.all([
                         fetch(`http://localhost:5000/api/split-vocals/download/${startData.jobId}/vocals`, { headers: { "Authorization": `Bearer ${token}` } }),
                         fetch(`http://localhost:5000/api/split-vocals/download/${startData.jobId}/background`, { headers: { "Authorization": `Bearer ${token}` } })
@@ -493,7 +524,6 @@ const handleVocalSplit = async () => {
                     const vocalsFileObj = new File([vocalsBlob], `Vocals_${audioFile.name}.mp3`, { type: "audio/mpeg" });
                     const bgFileObj = new File([bgBlob], `Music_${audioFile.name}.mp3`, { type: "audio/mpeg" });
                     
-                    // ✅ حفظ المسارات في الـ State دون حذف الملف الأصلي!
                     setIsolatedVocals(vocalsFileObj);
                     setIsolatedBackground(bgFileObj);
                     
@@ -523,7 +553,6 @@ const handleVocalSplit = async () => {
     }
   };
 
-  
   const handleWaveformReady = () => {
     if (isProcessing) {
       clearInterval(loadingIntervalRef.current);
@@ -574,8 +603,8 @@ const handleVocalSplit = async () => {
   };
 
   const hasTranscriptData = transcriptionData && transcriptionData.length > 0;
-  // +++ درع حماية الشاشة السوداء (يمنع تمرير قيم غير معروفة للموجات) +++
-const safeSeekToTime = (seekToTime !== null && Number.isFinite(seekToTime)) ? seekToTime : null;
+  const safeSeekToTime = (seekToTime !== null && Number.isFinite(seekToTime)) ? seekToTime : null;
+
   return (
     <div className="h-screen w-full bg-[#030303] text-gray-200 flex flex-col overflow-hidden font-sans select-none">
       
@@ -634,11 +663,8 @@ const safeSeekToTime = (seekToTime !== null && Number.isFinite(seekToTime)) ? se
           </div>
 
           <div className="text-[10px] font-mono uppercase tracking-wider text-gray-600 shrink-0">Neural Audio Tools</div>
-{/* أداة عزل الصوت والموسيقى - مع خيار الجودة */}
           <div className="w-full shrink-0 bg-[#090a0e]/60 border border-indigo-500/20 p-3 rounded-xl flex flex-col gap-3 relative overflow-hidden">
             <div className="flex items-center gap-3"><span className="text-xl">🪓</span><span className="text-sm font-semibold text-indigo-400">Multi-Stem Extractor</span></div>
-            
-            {/* +++ القائمة المنسدلة لاختيار الجودة +++ */}
             <select 
               value={extractionQuality} 
               onChange={(e) => setExtractionQuality(e.target.value)} 
@@ -647,31 +673,76 @@ const safeSeekToTime = (seekToTime !== null && Number.isFinite(seekToTime)) ? se
               <option value="fast">⚡ Fast Mode (~1-2 mins)</option>
               <option value="studio">🎧 Studio Quality (~6 mins)</option>
             </select>
-
             <button onClick={handleVocalSplit} disabled={isProcessing} className="w-full mt-1 py-2.5 bg-gradient-to-r from-indigo-600 to-blue-600 hover:from-indigo-500 text-white font-bold text-xs rounded-lg transition-all disabled:opacity-40 shadow-[0_0_15px_rgba(79,70,229,0.3)]">
               Extract Vocals & Music
             </button>
           </div>
           
-          <div className="w-full shrink-0 bg-[#0a0a0a] border border-gray-800 p-3 rounded-xl flex flex-col gap-3 relative">
-            <div className="flex items-center gap-2">
-              <span className="text-xl">✂️</span>
-              <span className="text-sm font-bold text-gray-200">Smart Visual Trimmer</span>
-            </div>
             
-            <div className="bg-blue-900/10 border border-blue-500/20 rounded p-2 flex items-start gap-2">
-              <span className="text-blue-400 text-xs mt-0.5">💡</span>
-              <p className="text-[9px] text-blue-300 leading-relaxed">
-                Select your audio type below. For mixed audio, the system requires isolated vocals to find exact silence gaps.
-              </p>
+<div className="w-full shrink-0 bg-[#0a0a0a] border border-gray-800 p-3 rounded-xl flex flex-col gap-3 relative">
+            
+            {/* +++ العنوان مع زر فتح الخريطة الإرشادية (باللغة الإنجليزية) +++ */}
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="text-xl">✂️</span>
+                <span className="text-sm font-bold text-gray-200">Smart Visual Trimmer</span>
+              </div>
+              <button 
+                onClick={() => setShowTrimmerGuide(!showTrimmerGuide)} 
+                className={`text-[10px] px-2 py-1 rounded-md transition-all duration-300 font-bold ${showTrimmerGuide ? 'bg-gray-800 text-gray-400' : 'bg-blue-500/20 text-blue-400 hover:bg-blue-500/30'}`}
+              >
+                {showTrimmerGuide ? '✕ Hide Guide' : 'How it works? 💡'}
+              </button>
             </div>
 
-            {/* +++ القائمة المنسدلة الجديدة المنظمة +++ */}
+            {/* +++ خريطة الاستخدام (تظهر فقط عند الضغط على الزر) +++ */}
+            {showTrimmerGuide && (
+              <div className="bg-[#050505] border border-gray-800/80 rounded-lg p-3 flex flex-col gap-3 animate-fade-in shadow-inner">
+                <h4 className="text-[10px] text-gray-500 font-bold uppercase tracking-wider text-center border-b border-gray-800 pb-2">Smart Trimmer Workflow</h4>
+                
+                {/* الخطوة 1: تهيئة الصوت */}
+                <div className="flex items-start gap-2">
+                   <div className="w-5 h-5 shrink-0 bg-blue-900/30 text-blue-400 rounded-full flex items-center justify-center text-[10px] font-bold">1</div>
+                   <p className="text-[10px] text-gray-400 leading-relaxed mt-0.5"><strong className="text-gray-200">Audio Setup:</strong> Select whether the track is "Pure Voice" or "Mixed Audio". (If mixed, you must extract vocals from the top tool first).</p>
+                </div>
+                
+                {/* الخطوة 2: الفحص الدقيق */}
+                <div className="flex items-start gap-2">
+                   <div className="w-5 h-5 shrink-0 bg-purple-900/30 text-purple-400 rounded-full flex items-center justify-center text-[10px] font-bold">2</div>
+                   <p className="text-[10px] text-gray-400 leading-relaxed mt-0.5"><strong className="text-gray-200">Precision Scan:</strong> Click the Highlight Silences button. The AI will draw (Red Boxes) over all silence and noise gaps.</p>
+                </div>
+                
+                {/* الخطوة 3: المعاينة */}
+                <div className="flex items-start gap-2">
+                   <div className="w-5 h-5 shrink-0 bg-amber-900/30 text-amber-400 rounded-full flex items-center justify-center text-[10px] font-bold">3</div>
+                   <p className="text-[10px] text-gray-400 leading-relaxed mt-0.5"><strong className="text-gray-200">Preview (Crucial):</strong> Use <span className="text-blue-400">▶️</span> to hear the gap, <span className="text-emerald-400">⏭️</span> to preview the jump cut, and <span className="text-red-400">❌</span> to cancel if a word is important.</p>
+                </div>
+                
+                {/* الخطوة 4: القص النهائي */}
+                <div className="flex items-start gap-2">
+                   <div className="w-5 h-5 shrink-0 bg-emerald-900/30 text-emerald-400 rounded-full flex items-center justify-center text-[10px] font-bold">4</div>
+                   <p className="text-[10px] text-gray-400 leading-relaxed mt-0.5"><strong className="text-gray-200">Final Cut:</strong> Use <span className="text-red-400">✂️</span> to cut a single gap instantly, or the bottom green button to cut all gaps at once!</p>
+                </div>
+              </div>
+            )}
+            
+            {/* الرسالة التحذيرية القديمة (نخفيها إذا فتح المستخدم الخريطة التفصيلية) */}
+            {!showTrimmerGuide && (
+              <div className="bg-blue-900/10 border border-blue-500/20 rounded p-2 flex items-start gap-2">
+                <span className="text-blue-400 text-xs mt-0.5">💡</span>
+                <p className="text-[9px] text-blue-300 leading-relaxed">
+                  Select your audio type below. For mixed audio, the system requires pure isolated vocals to find exact silence gaps.
+                </p>
+              </div>
+            )}
+
+            {/* +++ القائمة المنسدلة لاختيار نوع الصوت +++ */}
             <select 
               value={trimmerMode} 
               onChange={(e) => setTrimmerMode(e.target.value)} 
               className="bg-[#040404] border border-gray-700 text-xs rounded-lg p-2 text-emerald-400 outline-none focus:border-emerald-500 transition-colors"
             >
+// ...
               <option value="pure_voice">🎙️ Pure Voice (Podcasts / Clean Speech)</option>
               <option value="mixed_audio">🎬 Mixed Audio (Speech + Music/Effects)</option>
             </select>
@@ -683,18 +754,17 @@ const safeSeekToTime = (seekToTime !== null && Number.isFinite(seekToTime)) ? se
             >
               Highlight Silences (Visual)
             </button>
-                      {/* +++ قائمة الفراغات المكتشفة مع أدوات المعاينة +++ */}
+
+            {/* +++ الواجهة الجديدة المنظفة للأزرار +++ */}
             {suggestedSilences.length > 0 && (
               <div className="mt-4 flex flex-col gap-2 max-h-56 overflow-y-auto pr-1 custom-scrollbar">
                 <div className="flex items-center justify-between">
                   <div className="text-xs font-bold text-gray-400">✂️ Gaps to Cut ({suggestedSilences.length})</div>
-                  {/* زر لتفريغ القائمة بالكامل */}
                   <button onClick={() => setSuggestedSilences([])} className="text-[10px] text-red-400 hover:text-red-300">Clear All</button>
                 </div>
                 
                 {suggestedSilences.map((gap, idx) => (
                   <div key={idx} className="flex items-center justify-between bg-[#111] border border-gray-800 p-2 rounded-lg hover:border-gray-700 transition-colors">
-                    
                     <span className="text-[10px] text-gray-300 font-mono flex gap-1">
                       <span className="text-emerald-500/70">{gap.start.toFixed(1)}s</span> 
                       <span>➔</span> 
@@ -702,66 +772,55 @@ const safeSeekToTime = (seekToTime !== null && Number.isFinite(seekToTime)) ? se
                     </span>
                     
                     <div className="flex gap-1">
-                      {/* 1. زر الاستماع للفراغ نفسه (للتأكد مما سيتم حذفه) */}
                       <button 
-                        onClick={() => {
-                          if (previewGap && previewGap.index === idx && previewGap.type === 'play_gap') {
-                            setPreviewGap(null);
-                          } else {
-                            setPreviewGap({ ...gap, index: idx, type: 'play_gap' }); // تحديد نوع المعاينة
-                          }
-                        }}
-                        className={`p-1.5 flex items-center justify-center rounded transition-all duration-300 ${previewGap?.index === idx && previewGap?.type === 'play_gap' ? 'bg-yellow-500/20 text-yellow-400 animate-pulse' : 'bg-gray-800/80 hover:bg-gray-700 text-gray-400'}`}
-                        title="Listen to what will be deleted"
+                        onClick={() => setPlaybackCommand({ time: gap.start, id: Date.now() })}
+                        className="p-1.5 flex items-center justify-center rounded bg-blue-900/30 hover:bg-blue-600/50 text-blue-400 transition-colors"
+                        title="تشغيل من بداية العلامة"
                       >
-                        {previewGap?.index === idx && previewGap?.type === 'play_gap' ? '🎧...' : '🔊'}
+                        ▶️
                       </button>
 
-                      {/* 2. زر معاينة القفزة والدمج (Jump Cut) */}
                       <button 
                         onClick={() => {
-                          if (previewGap && previewGap.index === idx && previewGap.type === 'jump') {
-                            setPreviewGap(null);
-                          } else {
-                            setPreviewGap({ ...gap, index: idx, type: 'jump' }); // تحديد نوع المعاينة
+                          if (idx < suggestedSilences.length - 1) {
+                            setPlaybackCommand({ time: suggestedSilences[idx + 1].start, id: Date.now() });
                           }
                         }}
-                        className={`p-1.5 flex items-center justify-center rounded transition-all duration-300 ${previewGap?.index === idx && previewGap?.type === 'jump' ? 'bg-emerald-500/20 text-emerald-400 animate-pulse' : 'bg-blue-900/30 hover:bg-blue-600/50 text-blue-400'}`}
-                        title="Preview the transition (Jump Cut)"
+                        disabled={idx === suggestedSilences.length - 1} 
+                        className="p-1.5 flex items-center justify-center rounded bg-gray-800 hover:bg-gray-700 text-gray-400 disabled:opacity-30 transition-colors"
+                        title="القفز إلى العلامة التالية"
                       >
-                        {previewGap?.index === idx && previewGap?.type === 'jump' ? '🎧 Stop' : '⏭️ Jump'}
+                        ⏭️
                       </button>
                       
-                      {/* 3. زر حذف الفراغ (إلغاء القص لهذا المقطع) */}
                       <button 
                         onClick={() => setSuggestedSilences(prev => prev.filter((_, i) => i !== idx))}
-                        className="p-1.5 flex items-center justify-center rounded bg-red-900/30 hover:bg-red-600/50 text-red-400 transition-colors"
-                        title="Ignore this gap"
+                        className="p-1.5 flex items-center justify-center rounded bg-gray-800 hover:bg-red-900/60 text-gray-500 hover:text-red-400 transition-colors"
+                        title="إلغاء التحديد (الاحتفاظ بهذا الصوت)"
                       >
                         ❌
                       </button>
+<button 
+    onClick={() => handleCutSingleGap(gap, idx)}
+    className="p-1.5 flex items-center justify-center rounded bg-red-900/30 hover:bg-red-600/50 text-red-400 transition-colors border border-red-900/50"
+    title="قص هذه العلامة فوراً"
+  >
+    ✂️
+  </button>
                     </div>
                   </div>
                 ))}
                 
-                {/* زر تأكيد القص الفعلي وإرساله للسيرفر */}
-                <button 
-                  onClick={() => handleManualCuts(suggestedSilences)} 
-                  className="w-full mt-2 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-lg text-xs font-bold transition-all text-white shadow-[0_0_15px_rgba(16,185,129,0.3)]"
-                >
-                  ✂️ Confirm & Cut All
-                </button>
+<button 
+    onClick={executeAllSuggestedCuts} 
+    className="w-full mt-2 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-lg text-xs font-bold transition-all text-white shadow-[0_0_15px_rgba(16,185,129,0.3)]"
+  >
+    ✂️ Confirm & Cut All
+  </button>
               </div>
             )}
-
-
           </div>
           
-
-
-          
-
-
           <div className="w-full shrink-0 bg-[#090a0e]/60 border border-purple-500/20 p-3 rounded-xl flex flex-col gap-3 relative overflow-hidden">
             <div className="flex items-center gap-3"><span className="text-xl">📝</span><span className="text-sm font-semibold text-purple-400">Cloud AI API</span></div>
             <select value={audioLanguage} onChange={(e) => setAudioLanguage(e.target.value)} className="bg-[#040404] border border-gray-800 text-xs rounded-lg p-2 text-gray-300 outline-none">
@@ -778,7 +837,6 @@ const safeSeekToTime = (seekToTime !== null && Number.isFinite(seekToTime)) ? se
             <button onClick={handleTranscribeWithAPI} disabled={isProcessing} className="w-full mt-2 py-2.5 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 text-white font-bold text-xs rounded-lg transition-all disabled:opacity-40">Fetch API Transcript</button>
           </div>
 
-          {/* لوحة الـ FX Rack الأصلية التي تحبها */}
           <div className="w-full shrink-0 bg-[#070707] border border-gray-800 p-4 rounded-xl flex flex-col gap-4 relative overflow-hidden shadow-inner">
             <div className="text-[10px] font-mono uppercase tracking-wider text-emerald-500 mb-1 flex items-center justify-between">
               <span className="flex items-center gap-2"><span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></span>Active FX Rack</span>
@@ -795,13 +853,20 @@ const safeSeekToTime = (seekToTime !== null && Number.isFinite(seekToTime)) ? se
               <p className="text-[9px] text-gray-500">EQ & Balanced Compression</p>
             </div>
 
-            <div className={`p-3 rounded-lg border transition-all ${deEsserMode !== 'none' ? 'bg-blue-900/10 border-blue-500/30' : 'bg-[#0a0a0a] border-gray-800'}`}>
+{/* +++ الواجهة النظيفة للـ De-Esser (مربوطة بالباك إند) +++ */}
+            <div className="p-3 rounded-lg border bg-[#0a0a0a] border-gray-800 transition-all hover:border-blue-500/30">
               <div className="flex justify-between items-center mb-3">
-                <span className={`text-xs font-bold ${deEsserMode !== 'none' ? 'text-blue-400' : 'text-gray-400'}`}>🤫 Sibilance Engine (De-Ess)</span>
+                <span className="text-xs font-bold text-blue-400">🤫 Sibilance Engine (De-Ess)</span>
               </div>
               <div className="flex flex-col gap-2">
-                <button onClick={() => { setDeEsserMode(deEsserMode === 'auto' ? 'none' : 'auto'); setInteractionMode('cut'); }} className={`py-1.5 rounded text-[10px] font-bold border transition-colors flex items-center justify-center gap-2 ${deEsserMode === 'auto' ? 'bg-blue-600/30 border-blue-500 text-blue-300' : 'bg-black border-gray-800 text-gray-500 hover:border-gray-600'}`}>🪄 Smart AI Auto-Detect</button>
-                <button onClick={() => { const newMode = deEsserMode === 'manual' ? 'none' : 'manual'; setDeEsserMode(newMode); setInteractionMode(newMode === 'manual' ? 'de_ess' : 'cut'); }} className={`py-1.5 rounded text-[10px] font-bold border transition-colors flex items-center justify-center gap-2 ${deEsserMode === 'manual' ? 'bg-yellow-600/30 border-yellow-500 text-yellow-300 shadow-[0_0_10px_rgba(234,179,8,0.2)]' : 'bg-black border-gray-800 text-gray-500 hover:border-gray-600'}`}>🎯 Target Specific 'S' (Print)</button>
+                <button 
+                  onClick={handleExtractFingerprint} 
+                  disabled={isProcessing || !audioFile}
+                  className="py-2 rounded-lg text-[10px] font-bold border transition-colors flex items-center justify-center gap-2 bg-blue-600/20 border-blue-500 text-blue-300 shadow-[0_0_15px_rgba(59,130,246,0.2)] hover:bg-blue-600/40 disabled:opacity-50"
+                >
+                  🪄 Smart AI Auto-Detect & Remove 'S'
+                </button>
+                <p className="text-[9px] text-gray-500 text-center">يتم إرسال الملف لسيرفر الاستوديو لتنقيته بالكامل</p>
               </div>
             </div>
 
@@ -836,10 +901,8 @@ const safeSeekToTime = (seekToTime !== null && Number.isFinite(seekToTime)) ? se
             <SmartDropzone onFileDrop={handleFileReceived} /> 
           ) : (
             <>
-              {/* واجهة عرض المسارات المتعددة */}
               <div className="flex-1 flex flex-col w-full max-w-5xl h-full gap-5 overflow-y-auto pr-2" style={{ scrollbarWidth: 'thin', scrollbarColor: '#333 transparent' }}>
                 
-                {/* 1. المسار الأصلي (Master Track) */}
                 {audioFile && (
                   <div className="bg-[#0a0a0a] rounded-2xl border border-gray-800 p-4 shadow-lg shrink-0 flex flex-col">
                     <div className="flex items-center justify-between mb-3 border-b border-gray-800 pb-2">
@@ -848,6 +911,7 @@ const safeSeekToTime = (seekToTime !== null && Number.isFinite(seekToTime)) ? se
                         <h3 className="text-sm font-bold text-gray-200 uppercase tracking-wider">Master Track (Original)</h3>
                       </div>
                     </div>
+                    {/* تمرير أمر التشغيل للواجهة فقط */}
                     <StudioWaveform 
                       file={audioFile} 
                       onClear={() => { 
@@ -856,8 +920,7 @@ const safeSeekToTime = (seekToTime !== null && Number.isFinite(seekToTime)) ? se
                         setHistory([{ isSplit: false, isEnhanced: false, transcriptionData: [] }]);
                         setSpeed(1); setPitch(0); setDeEsserMode('none'); setInteractionMode('cut'); setReverbAmount(0); setSuggestedSilences([]);
                       }} 
-                      previewGap={previewGap} /* +++ هذه الخاصية الجديدة +++ */
-                      onPreviewEnd={() => setPreviewGap(null)}
+                      playbackCommand={playbackCommand} 
                       onTimeUpdate={setCurrentTime} 
                       onPlayStateChange={setIsPlaying} 
                       onDurationChange={setDuration} 
@@ -878,7 +941,6 @@ const safeSeekToTime = (seekToTime !== null && Number.isFinite(seekToTime)) ? se
                   </div>
                 )}
 
-                {/* 2. مسار الصوت البشري (Vocals) - تم إصلاح المشكلة وتمرير الخصائص المفقودة */}
                 {isolatedVocals && (
                   <div className="bg-indigo-900/10 rounded-2xl border border-indigo-500/20 p-4 shadow-lg shrink-0 animate-fade-in flex flex-col">
                     <div className="flex items-center justify-between mb-3 border-b border-indigo-500/20 pb-2">
@@ -894,7 +956,7 @@ const safeSeekToTime = (seekToTime !== null && Number.isFinite(seekToTime)) ? se
                       onTimeUpdate={() => {}} 
                       onPlayStateChange={() => {}} 
                       onDurationChange={() => {}} 
-                      seekToTime={safeSeekToTime} /* +++ هذه هي الخاصية التي كانت مفقودة وسببت الشاشة السوداء +++ */
+                      seekToTime={safeSeekToTime} 
                       isEnhanced={false} 
                       speed={speed} 
                       pitch={0} 
@@ -911,7 +973,6 @@ const safeSeekToTime = (seekToTime !== null && Number.isFinite(seekToTime)) ? se
                   </div>
                 )}
 
-                {/* 3. مسار الموسيقى (Background) - تم إصلاح المشكلة وتمرير الخصائص المفقودة */}
                 {isolatedBackground && (
                   <div className="bg-purple-900/10 rounded-2xl border border-purple-500/20 p-4 shadow-lg shrink-0 animate-fade-in flex flex-col">
                     <div className="flex items-center justify-between mb-3 border-b border-purple-500/20 pb-2">
@@ -927,7 +988,7 @@ const safeSeekToTime = (seekToTime !== null && Number.isFinite(seekToTime)) ? se
                       onTimeUpdate={() => {}} 
                       onPlayStateChange={() => {}} 
                       onDurationChange={() => {}} 
-                      seekToTime={safeSeekToTime} /* +++ هذه هي الخاصية التي كانت مفقودة وسببت الشاشة السوداء +++ */
+                      seekToTime={safeSeekToTime} 
                       isEnhanced={false} 
                       speed={speed} 
                       pitch={0} 

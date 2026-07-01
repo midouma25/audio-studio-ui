@@ -19,8 +19,10 @@ const generateReverbImpulse = (ctx) => {
 export default function StudioWaveform({ 
   file, onClear, onTimeUpdate, onPlayStateChange, onDurationChange, seekToTime, 
   isEnhanced, speed = 1, pitch = 0, deEsserMode = 'none', interactionMode = 'cut', reverbAmount = 0,
-  onApplyManualCuts, onExtractFingerprint, suggestedSilences = [], isProcessing = false, processLog = "", onReady, previewGap, onPreviewEnd
+  onApplyManualCuts, onExtractFingerprint, suggestedSilences = [], isProcessing = false, processLog = "", onReady, 
+  playbackCommand // +++ استقبلنا أمر التشغيل الجديد
 }) {
+
   const waveformRef = useRef(null);
   const wsRef = useRef(null);
   const wsRegionsRef = useRef(null);
@@ -44,7 +46,7 @@ export default function StudioWaveform({
   const onReadyRef = useRef(onReady);
   useEffect(() => { onReadyRef.current = onReady; }, [onReady]);
 
-  // +++ تهيئة ورسم الموجة الصوتية (الذي كان محذوفاً بالخطأ) +++
+  // +++ تهيئة ورسم الموجة الصوتية +++
   useEffect(() => {
     if (!waveformRef.current) return;
     
@@ -100,73 +102,15 @@ export default function StudioWaveform({
     }
   }, [file]);
 
-// +++ محرك المعاينة المزدوج (استماع للفراغ + معاينة القفزة) +++
+  // +++ استجابة فورية ونظيفة لأوامر التشغيل من الواجهة +++
   useEffect(() => {
-    if (!wsRef.current || !previewGap) return;
-
-    const ws = wsRef.current;
-    let monitorInterval;
-
-    // --- الوضع الأول: الاستماع للفراغ فقط (Play Gap) ---
-    if (previewGap.type === 'play_gap') {
-      ws.setTime(previewGap.start);
-      ws.play();
-
-      monitorInterval = setInterval(() => {
-        if (!ws.isPlaying()) {
-          clearInterval(monitorInterval);
-          if (onPreviewEnd) onPreviewEnd();
-          return;
-        }
-        // إيقاف التشغيل بمجرد الوصول لنهاية المربع الأحمر
-        if (ws.getCurrentTime() >= previewGap.end) {
-          ws.pause();
-          clearInterval(monitorInterval);
-          if (onPreviewEnd) onPreviewEnd();
-        }
-      }, 50);
-    } 
-    // --- الوضع الثاني: معاينة الانتقال والقفز (Jump Cut) ---
-    else if (previewGap.type === 'jump') {
-      const PRE_ROLL = 2;  
-      const POST_ROLL = 2; 
-
-      const startTime = Math.max(0, previewGap.start - PRE_ROLL);
-      const stopTime = previewGap.end + POST_ROLL;
-
-      ws.setTime(startTime);
-      ws.play();
-
-      monitorInterval = setInterval(() => {
-        if (!ws.isPlaying()) {
-          clearInterval(monitorInterval);
-          if (onPreviewEnd) onPreviewEnd();
-          return;
-        }
-
-        const currentSec = ws.getCurrentTime();
-
-        // الخدعة السحرية: القفز فوق الفراغ
-        if (currentSec >= previewGap.start && currentSec < previewGap.end) {
-          ws.setTime(previewGap.end);
-        }
-
-        // إيقاف المعاينة بعد ثانيتين من الفراغ
-        if (currentSec >= stopTime) {
-          ws.pause();
-          clearInterval(monitorInterval);
-          if (onPreviewEnd) onPreviewEnd();
-        }
-      }, 50);
+    if (wsRef.current && playbackCommand) {
+      wsRef.current.setTime(playbackCommand.time); // ضع المؤشر في البداية
+      wsRef.current.play(); // قم بالتشغيل
     }
+  }, [playbackCommand]);
 
-    // تنظيف الـ Interval عند انتهاء المكون أو تغير الفراغ
-    return () => {
-      if (monitorInterval) clearInterval(monitorInterval);
-    };
-  }, [previewGap, onPreviewEnd]);
-  
-  // +++ السحر هنا: تغيير لون التحديد بناءً على وضع الأداة +++
+  // +++ تغيير لون التحديد بناءً على وضع الأداة +++
   useEffect(() => {
     if (wsRegionsRef.current) {
         wsRegionsRef.current.enableDragSelection({ 
@@ -244,6 +188,7 @@ export default function StudioWaveform({
 
     let currentNode = sourceNodeRef.current;
 
+// ❌ احذف هذا الكود الكارثي بالكامل من ملف StudioWaveform.jsx
     if (deEsserMode !== 'none') {
         deEsserCompRef.current.threshold.value = deEsserMode === 'manual' ? -45 : -30;
         deEsserCompRef.current.ratio.value = deEsserMode === 'manual' ? 20 : 12;
@@ -256,6 +201,7 @@ export default function StudioWaveform({
         currentNode = deEsserMergeRef.current;
     }
 
+    
     if (isEnhanced) {
         currentNode.connect(effectChainRef.current.in);
         currentNode = effectChainRef.current.out;

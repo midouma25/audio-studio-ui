@@ -359,4 +359,62 @@ router.post('/trim-audio', protect, upload.single('audio_file'), (req, res) => {
             });
         });
 });
+
+// ==========================================
+// 🎯 مسار الاستئصال الجراحي للسيبيلانس (Surgical De-Esser)
+// ==========================================
+router.post('/extract-fingerprint', protect, upload.single('audio_file'), (req, res) => {
+    if (!req.file) return res.status(400).json({ error: "Missing audio file" });
+
+    // استقبال إحداثيات المربع الأصفر
+    const targetRegion = req.body.targetRegion ? JSON.parse(req.body.targetRegion) : null;
+
+    const uploadsDir = path.join(__dirname, 'uploads');
+    if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
+
+    const jobId = `deess_${Date.now()}`;
+    const inputFile = path.join(uploadsDir, `${jobId}_input.wav`);
+    const outputFile = path.join(uploadsDir, `${jobId}_output.wav`);
+
+    fs.writeFileSync(inputFile, req.file.buffer);
+
+    let filterComplex = '';
+
+    if (targetRegion) {
+        console.log(`🎯 [Surgical De-Esser] Targeting harsh 'S' between ${targetRegion.start}s and ${targetRegion.end}s`);
+        
+        // 🪄 السحر هنا: نطبق Equalizer قوي جداً يخفض الترددات الحادة بمقدار -18 ديسيبل
+        // ولكننا نستخدم enable لجعله يعمل "فقط" في الوقت الذي حدده المستخدم بالمربع الأصفر!
+        const s = targetRegion.start;
+        const e = targetRegion.end;
+        
+        filterComplex = `equalizer=f=7500:width_type=q:width=1:g=-18:enable='between(t,${s},${e})',equalizer=f=5500:width_type=q:width=1:g=-12:enable='between(t,${s},${e})'`;
+    } else {
+        console.log(`🪄 [Auto De-Esser] Applying general dynamic de-esser...`);
+        // فلتر تلقائي خفيف إذا لم يحدد المستخدم مربعاً أصفر
+        filterComplex = 'deesser=i=0.7:m=m,equalizer=f=6500:width_type=h:width=2:g=-3';
+    }
+
+    ffmpeg(inputFile)
+        .audioFilter(filterComplex)
+        .audioCodec('pcm_s16le') // جودة الاستوديو
+        .save(outputFile)
+        .on('error', (err) => {
+            console.error(`❌ [De-Esser] FFmpeg Error:`, err.message);
+            if (fs.existsSync(inputFile)) fs.unlinkSync(inputFile);
+            if (!res.headersSent) res.status(500).json({ error: 'Audio de-essing failed' });
+        })
+        .on('end', () => {
+            console.log(`✅ [De-Esser] Sibilance successfully removed!`);
+            res.download(outputFile, 'DeEssed_Audio.wav', (err) => {
+                setTimeout(() => {
+                    try {
+                        if (fs.existsSync(inputFile)) fs.unlinkSync(inputFile);
+                        if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile);
+                    } catch (e) {}
+                }, 5000);
+            });
+        });
+});
+
 export default router;
