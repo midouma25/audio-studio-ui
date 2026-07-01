@@ -19,7 +19,7 @@ const generateReverbImpulse = (ctx) => {
 export default function StudioWaveform({ 
   file, onClear, onTimeUpdate, onPlayStateChange, onDurationChange, seekToTime, 
   isEnhanced, speed = 1, pitch = 0, deEsserMode = 'none', interactionMode = 'cut', reverbAmount = 0,
-  onApplyManualCuts, onExtractFingerprint, suggestedSilences = [], isProcessing = false, processLog = "", onReady 
+  onApplyManualCuts, onExtractFingerprint, suggestedSilences = [], isProcessing = false, processLog = "", onReady, previewGap, onPreviewEnd
 }) {
   const waveformRef = useRef(null);
   const wsRef = useRef(null);
@@ -44,36 +44,129 @@ export default function StudioWaveform({
   const onReadyRef = useRef(onReady);
   useEffect(() => { onReadyRef.current = onReady; }, [onReady]);
 
+  // +++ تهيئة ورسم الموجة الصوتية (الذي كان محذوفاً بالخطأ) +++
   useEffect(() => {
     if (!waveformRef.current) return;
-
-    const ws = WaveSurfer.create({
-      container: waveformRef.current, waveColor: '#374151', progressColor: '#10b981', 
-      cursorColor: '#ffffff', barWidth: 2, barGap: 2, barRadius: 2, height: 120, normalize: true,
-    });
-    const wsRegions = ws.registerPlugin(RegionsPlugin.create());
     
-    wsRef.current = ws; wsRegionsRef.current = wsRegions;
+    const ws = WaveSurfer.create({
+      container: waveformRef.current,
+      waveColor: 'rgba(52, 211, 153, 0.5)', 
+      progressColor: 'rgba(16, 185, 129, 0.8)', 
+      cursorColor: '#10b981',
+      barWidth: 2,
+      barRadius: 3,
+      cursorWidth: 2,
+      height: 120,
+      normalize: true,
+      backend: 'MediaElement'
+    });
+    wsRef.current = ws;
+
+    const wsRegions = ws.registerPlugin(RegionsPlugin.create());
+    wsRegionsRef.current = wsRegions;
 
     ws.on('ready', () => {
-      setDuration(ws.getDuration()); onDurationChange(ws.getDuration());
-      setupWebAudio(ws.getMediaElement()); 
-      if (onReadyRef.current) onReadyRef.current(); 
+       setDuration(ws.getDuration());
+       if (onDurationChange) onDurationChange(ws.getDuration());
+       if (onReadyRef.current) onReadyRef.current();
+       setupWebAudio(ws.getMediaElement());
     });
-
-    ws.on('audioprocess', (time) => { setCurrentTime(time); onTimeUpdate(time); });
-    ws.on('play', () => { setIsPlaying(true); onPlayStateChange(true); });
-    ws.on('pause', () => { setIsPlaying(false); onPlayStateChange(false); });
-    ws.on('finish', () => { setIsPlaying(false); onPlayStateChange(false); });
-    wsRegions.on('region-clicked', (region, e) => { e.stopPropagation(); region.remove(); });
+    
+    ws.on('audioprocess', () => {
+       const curr = ws.getCurrentTime();
+       setCurrentTime(curr);
+       if (onTimeUpdate) onTimeUpdate(curr);
+    });
+    
+    ws.on('play', () => { setIsPlaying(true); if (onPlayStateChange) onPlayStateChange(true); });
+    ws.on('pause', () => { setIsPlaying(false); if (onPlayStateChange) onPlayStateChange(false); });
+    ws.on('finish', () => { setIsPlaying(false); if (onPlayStateChange) onPlayStateChange(false); });
 
     return () => {
-      try { ws.destroy(); } catch(e) { }
-      if (audioCtxRef.current) { audioCtxRef.current.close(); audioCtxRef.current = null; }
+       ws.destroy();
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // +++ السحر هنا: تغيير لون التحديد بناءً على وضع الأداة (قص أحمر أو بصمة أصفر) +++
+  // +++ تحميل الملف +++
+  useEffect(() => {
+    if (file && wsRef.current) {
+      const url = URL.createObjectURL(file);
+      wsRef.current.load(url).catch(err => {
+          if (err.name !== 'AbortError') console.error('WaveSurfer loading error:', err);
+      });
+      if (wsRegionsRef.current) wsRegionsRef.current.clearRegions();
+      return () => URL.revokeObjectURL(url);
+    }
+  }, [file]);
+
+// +++ محرك المعاينة المزدوج (استماع للفراغ + معاينة القفزة) +++
+  useEffect(() => {
+    if (!wsRef.current || !previewGap) return;
+
+    const ws = wsRef.current;
+    let monitorInterval;
+
+    // --- الوضع الأول: الاستماع للفراغ فقط (Play Gap) ---
+    if (previewGap.type === 'play_gap') {
+      ws.setTime(previewGap.start);
+      ws.play();
+
+      monitorInterval = setInterval(() => {
+        if (!ws.isPlaying()) {
+          clearInterval(monitorInterval);
+          if (onPreviewEnd) onPreviewEnd();
+          return;
+        }
+        // إيقاف التشغيل بمجرد الوصول لنهاية المربع الأحمر
+        if (ws.getCurrentTime() >= previewGap.end) {
+          ws.pause();
+          clearInterval(monitorInterval);
+          if (onPreviewEnd) onPreviewEnd();
+        }
+      }, 50);
+    } 
+    // --- الوضع الثاني: معاينة الانتقال والقفز (Jump Cut) ---
+    else if (previewGap.type === 'jump') {
+      const PRE_ROLL = 2;  
+      const POST_ROLL = 2; 
+
+      const startTime = Math.max(0, previewGap.start - PRE_ROLL);
+      const stopTime = previewGap.end + POST_ROLL;
+
+      ws.setTime(startTime);
+      ws.play();
+
+      monitorInterval = setInterval(() => {
+        if (!ws.isPlaying()) {
+          clearInterval(monitorInterval);
+          if (onPreviewEnd) onPreviewEnd();
+          return;
+        }
+
+        const currentSec = ws.getCurrentTime();
+
+        // الخدعة السحرية: القفز فوق الفراغ
+        if (currentSec >= previewGap.start && currentSec < previewGap.end) {
+          ws.setTime(previewGap.end);
+        }
+
+        // إيقاف المعاينة بعد ثانيتين من الفراغ
+        if (currentSec >= stopTime) {
+          ws.pause();
+          clearInterval(monitorInterval);
+          if (onPreviewEnd) onPreviewEnd();
+        }
+      }, 50);
+    }
+
+    // تنظيف الـ Interval عند انتهاء المكون أو تغير الفراغ
+    return () => {
+      if (monitorInterval) clearInterval(monitorInterval);
+    };
+  }, [previewGap, onPreviewEnd]);
+  
+  // +++ السحر هنا: تغيير لون التحديد بناءً على وضع الأداة +++
   useEffect(() => {
     if (wsRegionsRef.current) {
         wsRegionsRef.current.enableDragSelection({ 
@@ -82,22 +175,7 @@ export default function StudioWaveform({
     }
   }, [interactionMode]);
   
-useEffect(() => {
-    if (file && wsRef.current) {
-      const url = URL.createObjectURL(file);
-      
-      // +++ إضافة catch لتجاهل خطأ AbortError الطبيعي +++
-      wsRef.current.load(url).catch(err => {
-          if (err.name !== 'AbortError') {
-              console.error('WaveSurfer loading error:', err);
-          }
-      });
-
-      if (wsRegionsRef.current) wsRegionsRef.current.clearRegions();
-      return () => URL.revokeObjectURL(url);
-    }
-  }, [file]);
-
+  // +++ رسم مناطق الفراغات +++
   useEffect(() => {
     if (!wsRegionsRef.current || suggestedSilences.length === 0) return;
     wsRegionsRef.current.clearRegions();
@@ -167,7 +245,6 @@ useEffect(() => {
     let currentNode = sourceNodeRef.current;
 
     if (deEsserMode !== 'none') {
-        // إذا كان الوضع يدوي، الضاغط يكون أكثر شراسة بكثير لاستهداف البصمة الدقيقة
         deEsserCompRef.current.threshold.value = deEsserMode === 'manual' ? -45 : -30;
         deEsserCompRef.current.ratio.value = deEsserMode === 'manual' ? 20 : 12;
 
@@ -236,7 +313,6 @@ useEffect(() => {
         if (currentStart < duration) keptRegions.push({ start: currentStart, end: duration });
         if (onApplyManualCuts) onApplyManualCuts(keptRegions);
     } else if (interactionMode === 'de_ess') {
-        // استخراج البصمة
         const targetRegion = { start: regions[0].start, end: regions[0].end };
         if (onExtractFingerprint) onExtractFingerprint(targetRegion);
     }
@@ -248,7 +324,7 @@ useEffect(() => {
     const s = Math.floor(secs % 60).toString().padStart(2, '0');
     return `${m}:${s}`;
   };
-
+    
   return (
     <div className="w-full max-w-4xl bg-[#080808] border border-gray-800 rounded-3xl p-6 shadow-2xl relative overflow-hidden transition-all duration-500">
       

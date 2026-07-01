@@ -295,5 +295,68 @@ router.get('/split-vocals/download/:jobId/:type', protect, (req, res) => {
         if (!res.headersSent) res.status(500).json({ error: "File streaming error" });
     }
 });
+// ==========================================
+// ✂️ مسار القص الاحترافي (مستقر وآمن 100%)
+// ==========================================
+router.post('/trim-audio', protect, upload.single('audio_file'), (req, res) => {
+    if (!req.file) return res.status(400).json({ error: "Missing audio file" });
+    if (!req.body.keptRegions) return res.status(400).json({ error: "Missing regions data" });
 
+    let keptRegions;
+    try {
+        keptRegions = JSON.parse(req.body.keptRegions);
+    } catch (e) {
+        return res.status(400).json({ error: "Invalid regions formatting" });
+    }
+
+    if (!keptRegions || keptRegions.length === 0) {
+        return res.status(400).json({ error: "No regions to keep" });
+    }
+
+    const uploadsDir = path.join(__dirname, 'uploads');
+    if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
+
+    const jobId = `trim_${Date.now()}`;
+    const inputFile = path.join(uploadsDir, `${jobId}_input.wav`);
+    const outputFile = path.join(uploadsDir, `${jobId}_output.mp3`);
+
+    fs.writeFileSync(inputFile, req.file.buffer);
+
+    console.log(`✂️ [Trimmer] Processing ${keptRegions.length} regions securely...`);
+
+    let filterComplex = "";
+    let inputs = "";
+    
+    // بناء فلتر القص بطريقة نظيفة بدون فلاتر تلاعب زمني معقدة
+    keptRegions.forEach((region, index) => {
+        // نستخدم atrim للقص، ونعيد ضبط الـ PTS لكل مقطع لكي لا يحدث تشوه
+        filterComplex += `[0:a]atrim=start=${region.start}:end=${region.end},asetpts=PTS-STARTPTS[a${index}];`;
+        inputs += `[a${index}]`;
+    });
+
+    // دمج المقاطع (Concat) بطريقة متسلسلة صحيحة
+    filterComplex += `${inputs}concat=n=${keptRegions.length}:v=0:a=1[out]`;
+
+    ffmpeg(inputFile)
+        .complexFilter(filterComplex, ['out'])
+        .audioCodec('libmp3lame')
+        .audioBitrate('320k') // جودة الاستوديو
+        .save(outputFile)
+        .on('error', (err) => {
+            console.error(`❌ [Trimmer] FFmpeg Error:`, err.message);
+            if (fs.existsSync(inputFile)) fs.unlinkSync(inputFile);
+            if (!res.headersSent) res.status(500).json({ error: 'Audio trimming failed' });
+        })
+        .on('end', () => {
+            console.log(`✅ [Trimmer] Audio trimmed cleanly! Sending to React...`);
+            res.download(outputFile, 'Trimmed_Audio.mp3', (err) => {
+                setTimeout(() => {
+                    try {
+                        if (fs.existsSync(inputFile)) fs.unlinkSync(inputFile);
+                        if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile);
+                    } catch (e) {}
+                }, 5000);
+            });
+        });
+});
 export default router;

@@ -24,7 +24,6 @@ function bufferToWave(abuffer, len) {
   }
   return new Blob([buffer], {type: "audio/wav"});
 }
-
 const applyCutsToAudio = async (file, keptRegions) => {
   try {
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -62,6 +61,7 @@ const applyCutsToAudio = async (file, keptRegions) => {
 };
 
 export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user, setUser }) { 
+  const [previewGap, setPreviewGap] = useState(null); // حالة المعاينة الجديدة
   const [audioFile, setAudioFile] = useState(null); 
   const [isolatedVocals, setIsolatedVocals] = useState(null);
   const [isolatedBackground, setIsolatedBackground] = useState(null);
@@ -70,6 +70,8 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
   const [duration, setDuration] = useState(0);
   const [seekToTime, setSeekToTime] = useState(null);
   const [timelineHeight, setTimelineHeight] = useState(288); 
+   
+  const [previewingIndex, setPreviewingIndex] = useState(null);
 
   const [history, setHistory] = useState([{ isSplit: false, isEnhanced: false, transcriptionData: [] }]);
   const [historyIndex, setHistoryIndex] = useState(0);
@@ -118,7 +120,7 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
       fetchSavedProject();
     }
   }, [projectId]);
-
+   
   const downloadAudio = async (prefix = "") => {
     if (!audioFile) return;
 
@@ -248,67 +250,144 @@ export default function AudioWorkspace({ onBack, projectId, onCreditUpdate, user
     setHistoryIndex(0);
   };
 
-  const handleSmartTrimSilence = async () => {
-    if (!activeTranscriptId) return alert("⚠️ Please load or fetch an API Transcript first!");
+
+
+// +++ كاشف الفراغات الهجين مع "هوامش الأمان" والتنظيم الذكي +++
+  const handleDetectSilencesVisually = async () => {
+    if (!audioFile) return alert("⚠️ Please load an audio file first!");
+    
+    // +++ نظام الحماية الذكي: توجيه المستخدم إذا اختار "صوت مع موسيقى" ولم يعزل الصوت +++
+    if (trimmerMode === "mixed_audio" && !isolatedVocals && !hasTranscriptData) {
+      alert("🛑 For Mixed Audio (Speech + Music), the scanner needs pure voice to be accurate!\n\nPlease use the 'Extract Vocals & Music' button above first, or fetch a Transcript.");
+      return; 
+    }
+
     setIsProcessing(true);
-    setProcessLog(`✂️ Scanning timeline for dead air...`);
     
     try {
-      const token = localStorage.getItem("token");
-      const response = await fetch(`http://localhost:5000/api/trim-silence/${activeTranscriptId}`, {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ mode: trimmerMode })
-      });
+      let silences = [];
+      const padding = 0.2; // ⏱️ هامش الأمان: 200 مللي ثانية لحماية أطراف الكلمات
       
-      if (!response.ok) throw new Error("Backend response not OK");
-      const data = await response.json();
-
-      if (data.timeSaved > 0 && data.keptRegions && data.keptRegions.length > 0) {
-        let silences = [];
-        if (data.keptRegions[0].start > 0) silences.push({ start: 0, end: data.keptRegions[0].start });
-        for (let i = 0; i < data.keptRegions.length - 1; i++) {
-            if (data.keptRegions[i+1].start > data.keptRegions[i].end) {
-                silences.push({ start: data.keptRegions[i].end, end: data.keptRegions[i+1].start });
-            }
+      if (hasTranscriptData) {
+        setProcessLog(`🧠 AI Vision: Reading speech gaps from Cloud Transcript...`);
+        let originalChunks = transcriptionData;
+        const minGap = 0.6; 
+        
+        if (originalChunks[0].startTime > minGap) {
+           silences.push({ start: 0, end: originalChunks[0].startTime - padding });
         }
-        setSuggestedSilences(silences); 
-        pushToHistory({ transcriptionData: data.chunks });
+        
+        for (let i = 0; i < originalChunks.length - 1; i++) {
+           const gap = originalChunks[i+1].startTime - originalChunks[i].endTime;
+           if (gap >= minGap) { 
+               const safeStart = originalChunks[i].endTime + padding;
+               const safeEnd = originalChunks[i+1].startTime - padding;
+               if (safeEnd > safeStart) {
+                   silences.push({ start: safeStart, end: safeEnd });
+               }
+           }
+        }
+        
+        if (duration > 0 && (duration - originalChunks[originalChunks.length - 1].endTime) > minGap) {
+           silences.push({ start: originalChunks[originalChunks.length - 1].endTime + padding, end: duration });
+        }
+        
       } else {
-        alert(`ℹ️ Notice: No significant silence detected.`);
+        // +++ تحديد الملف المراد فحصه بذكاء +++
+        const targetFileToScan = (trimmerMode === "mixed_audio" && isolatedVocals) ? isolatedVocals : audioFile;
+        
+        setProcessLog(targetFileToScan === isolatedVocals 
+          ? `🔍 Scanning pure isolated vocals for absolute accuracy...` 
+          : `🔍 Scanning original audio amplitude visually...`);
+          
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const arrayBuffer = await targetFileToScan.arrayBuffer();
+        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+        const channelData = audioBuffer.getChannelData(0);
+        const sampleRate = audioBuffer.sampleRate;
+        
+        let isSilent = false;
+        let silenceStart = 0;
+        const step = Math.floor(sampleRate * 0.1); 
+        // تغيير الحساسية: الصوت النقي يحتاج حساسية مختلفة عن الصوت المعزول
+        const threshold = trimmerMode === "pure_voice" ? 0.05 : 0.02; 
+
+        for (let i = 0; i < channelData.length; i += step) {
+          let sum = 0;
+          for (let j = 0; j < step && i + j < channelData.length; j++) {
+            sum += Math.abs(channelData[i + j]);
+          }
+          let rms = sum / step;
+          const currentTimeSec = i / sampleRate;
+
+          if (rms < threshold) {
+            if (!isSilent) { isSilent = true; silenceStart = currentTimeSec; }
+          } else {
+            if (isSilent) {
+              isSilent = false;
+              if (currentTimeSec - silenceStart > 0.6) { 
+                const safeStart = silenceStart + padding;
+                const safeEnd = currentTimeSec - padding;
+                if (safeEnd > safeStart) {
+                    silences.push({ start: safeStart, end: safeEnd });
+                }
+              }
+            }
+          }
+        }
       }
+      
+      setSuggestedSilences(silences); 
+      
+      if(silences.length === 0) {
+        alert(hasTranscriptData ? "ℹ️ AI Transcript shows continuous speech. No major gaps found." : "ℹ️ No prominent silences detected in this track.");
+      } else {
+        alert(`👀 Found ${silences.length} silence gaps! They are highlighted in red. Words are protected with a 200ms safety margin.`);
+      }
+
     } catch (error) {
-      alert(`❌ Process Failed: ${error.message}`);
+      alert(`❌ Analysis Failed: ${error.message}`);
     } finally {
       setIsProcessing(false);
       setProcessLog("");
     }
   };
 
-  const handleManualCuts = async (keptRegions) => {
-    if (!audioFile) return;
+
+
+
+const handleManualCuts = async (keptRegions) => {
+    if (!audioFile || !keptRegions || keptRegions.length === 0) return;
     setIsProcessing(true);
-    setProcessLog("✂️ Initiating Slicer...");
-
-    let step = 0;
-    loadingIntervalRef.current = setInterval(() => {
-      step++;
-      if(step === 1) setProcessLog("⚙️ Rebuilding Audio Matrix...");
-      if(step === 2) setProcessLog("🧹 Removing Silence Chunks...");
-      if(step === 3) setProcessLog("🪡 Stitching Audio Together...");
-      if(step > 3) setProcessLog("🎨 Drawing New Waveform...");
-    }, 1000);
-
-    await new Promise(resolve => setTimeout(resolve, 100));
+    setProcessLog("✂️ Uploading to FFmpeg Engine for perfect trimming...");
 
     try {
-      const trimmedAudioFile = await applyCutsToAudio(audioFile, keptRegions);
+      const formData = new FormData();
+      formData.append("audio_file", audioFile);
+      formData.append("keptRegions", JSON.stringify(keptRegions)); // إرسال المناطق التي نريد الاحتفاظ بها
+
+      const token = localStorage.getItem("token"); 
+      const response = await fetch("http://localhost:5000/api/trim-audio", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${token}` },
+        body: formData,
+      });
+
+      if (!response.ok) throw new Error("FFmpeg trimming failed on server.");
+
+      setProcessLog("📥 Downloading the perfectly trimmed audio...");
+      
+      const blob = await response.blob();
+      const trimmedAudioFile = new File([blob], `Trimmed_${audioFile.name}.mp3`, { type: "audio/mpeg" });
+      
       setAudioFile(trimmedAudioFile);
-      setSuggestedSilences([]); 
+      setSuggestedSilences([]); // مسح التظليلات بعد النجاح
+      alert("✂️ Success! Audio perfectly trimmed without freezing.");
+
     } catch (error) {
       console.error(error);
       alert(`🚨 Audio Engine Error: ${error.message}`);
-      clearInterval(loadingIntervalRef.current);
+    } finally {
       setIsProcessing(false);
       setProcessLog("");
     }
@@ -575,15 +654,113 @@ const safeSeekToTime = (seekToTime !== null && Number.isFinite(seekToTime)) ? se
           </div>
           
           <div className="w-full shrink-0 bg-[#0a0a0a] border border-gray-800 p-3 rounded-xl flex flex-col gap-3 relative">
-            <div className="flex items-center gap-2"><span className="text-xl">✂️</span><span className="text-sm font-bold text-gray-200">Smart Trimmer</span></div>
-            <select value={trimmerMode} onChange={(e) => setTrimmerMode(e.target.value)} className="bg-[#040404] border border-gray-700 text-xs rounded-lg p-2 text-emerald-400 outline-none focus:border-emerald-500 transition-colors">
-              <option value="ai_speech">🤖 AI Speech Gate (Aggressive Cut)</option>
-              <option value="acoustic">🔈 Acoustic Gate (Keep Natural Tone)</option>
+            <div className="flex items-center gap-2">
+              <span className="text-xl">✂️</span>
+              <span className="text-sm font-bold text-gray-200">Smart Visual Trimmer</span>
+            </div>
+            
+            <div className="bg-blue-900/10 border border-blue-500/20 rounded p-2 flex items-start gap-2">
+              <span className="text-blue-400 text-xs mt-0.5">💡</span>
+              <p className="text-[9px] text-blue-300 leading-relaxed">
+                Select your audio type below. For mixed audio, the system requires isolated vocals to find exact silence gaps.
+              </p>
+            </div>
+
+            {/* +++ القائمة المنسدلة الجديدة المنظمة +++ */}
+            <select 
+              value={trimmerMode} 
+              onChange={(e) => setTrimmerMode(e.target.value)} 
+              className="bg-[#040404] border border-gray-700 text-xs rounded-lg p-2 text-emerald-400 outline-none focus:border-emerald-500 transition-colors"
+            >
+              <option value="pure_voice">🎙️ Pure Voice (Podcasts / Clean Speech)</option>
+              <option value="mixed_audio">🎬 Mixed Audio (Speech + Music/Effects)</option>
             </select>
-            <button onClick={handleSmartTrimSilence} disabled={isProcessing || !hasTranscriptData} className={`w-full py-2 bg-gray-900 hover:bg-gray-800 border ${(!hasTranscriptData || isProcessing) ? 'border-gray-900 opacity-50 cursor-not-allowed' : 'border-gray-700 hover:border-emerald-500/40'} rounded-lg text-xs font-bold transition-all text-gray-300`}>
-              Find Silences
+            
+            <button 
+              onClick={handleDetectSilencesVisually} 
+              disabled={isProcessing || !audioFile} 
+              className={`w-full py-2 bg-gray-900 hover:bg-gray-800 border ${(!audioFile || isProcessing) ? 'border-gray-900 opacity-50 cursor-not-allowed' : 'border-gray-700 hover:border-emerald-500/40'} rounded-lg text-xs font-bold transition-all text-gray-300`}
+            >
+              Highlight Silences (Visual)
             </button>
+                      {/* +++ قائمة الفراغات المكتشفة مع أدوات المعاينة +++ */}
+            {suggestedSilences.length > 0 && (
+              <div className="mt-4 flex flex-col gap-2 max-h-56 overflow-y-auto pr-1 custom-scrollbar">
+                <div className="flex items-center justify-between">
+                  <div className="text-xs font-bold text-gray-400">✂️ Gaps to Cut ({suggestedSilences.length})</div>
+                  {/* زر لتفريغ القائمة بالكامل */}
+                  <button onClick={() => setSuggestedSilences([])} className="text-[10px] text-red-400 hover:text-red-300">Clear All</button>
+                </div>
+                
+                {suggestedSilences.map((gap, idx) => (
+                  <div key={idx} className="flex items-center justify-between bg-[#111] border border-gray-800 p-2 rounded-lg hover:border-gray-700 transition-colors">
+                    
+                    <span className="text-[10px] text-gray-300 font-mono flex gap-1">
+                      <span className="text-emerald-500/70">{gap.start.toFixed(1)}s</span> 
+                      <span>➔</span> 
+                      <span className="text-red-500/70">{gap.end.toFixed(1)}s</span>
+                    </span>
+                    
+                    <div className="flex gap-1">
+                      {/* 1. زر الاستماع للفراغ نفسه (للتأكد مما سيتم حذفه) */}
+                      <button 
+                        onClick={() => {
+                          if (previewGap && previewGap.index === idx && previewGap.type === 'play_gap') {
+                            setPreviewGap(null);
+                          } else {
+                            setPreviewGap({ ...gap, index: idx, type: 'play_gap' }); // تحديد نوع المعاينة
+                          }
+                        }}
+                        className={`p-1.5 flex items-center justify-center rounded transition-all duration-300 ${previewGap?.index === idx && previewGap?.type === 'play_gap' ? 'bg-yellow-500/20 text-yellow-400 animate-pulse' : 'bg-gray-800/80 hover:bg-gray-700 text-gray-400'}`}
+                        title="Listen to what will be deleted"
+                      >
+                        {previewGap?.index === idx && previewGap?.type === 'play_gap' ? '🎧...' : '🔊'}
+                      </button>
+
+                      {/* 2. زر معاينة القفزة والدمج (Jump Cut) */}
+                      <button 
+                        onClick={() => {
+                          if (previewGap && previewGap.index === idx && previewGap.type === 'jump') {
+                            setPreviewGap(null);
+                          } else {
+                            setPreviewGap({ ...gap, index: idx, type: 'jump' }); // تحديد نوع المعاينة
+                          }
+                        }}
+                        className={`p-1.5 flex items-center justify-center rounded transition-all duration-300 ${previewGap?.index === idx && previewGap?.type === 'jump' ? 'bg-emerald-500/20 text-emerald-400 animate-pulse' : 'bg-blue-900/30 hover:bg-blue-600/50 text-blue-400'}`}
+                        title="Preview the transition (Jump Cut)"
+                      >
+                        {previewGap?.index === idx && previewGap?.type === 'jump' ? '🎧 Stop' : '⏭️ Jump'}
+                      </button>
+                      
+                      {/* 3. زر حذف الفراغ (إلغاء القص لهذا المقطع) */}
+                      <button 
+                        onClick={() => setSuggestedSilences(prev => prev.filter((_, i) => i !== idx))}
+                        className="p-1.5 flex items-center justify-center rounded bg-red-900/30 hover:bg-red-600/50 text-red-400 transition-colors"
+                        title="Ignore this gap"
+                      >
+                        ❌
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                
+                {/* زر تأكيد القص الفعلي وإرساله للسيرفر */}
+                <button 
+                  onClick={() => handleManualCuts(suggestedSilences)} 
+                  className="w-full mt-2 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-lg text-xs font-bold transition-all text-white shadow-[0_0_15px_rgba(16,185,129,0.3)]"
+                >
+                  ✂️ Confirm & Cut All
+                </button>
+              </div>
+            )}
+
+
           </div>
+          
+
+
+          
+
 
           <div className="w-full shrink-0 bg-[#090a0e]/60 border border-purple-500/20 p-3 rounded-xl flex flex-col gap-3 relative overflow-hidden">
             <div className="flex items-center gap-3"><span className="text-xl">📝</span><span className="text-sm font-semibold text-purple-400">Cloud AI API</span></div>
@@ -679,6 +856,8 @@ const safeSeekToTime = (seekToTime !== null && Number.isFinite(seekToTime)) ? se
                         setHistory([{ isSplit: false, isEnhanced: false, transcriptionData: [] }]);
                         setSpeed(1); setPitch(0); setDeEsserMode('none'); setInteractionMode('cut'); setReverbAmount(0); setSuggestedSilences([]);
                       }} 
+                      previewGap={previewGap} /* +++ هذه الخاصية الجديدة +++ */
+                      onPreviewEnd={() => setPreviewGap(null)}
                       onTimeUpdate={setCurrentTime} 
                       onPlayStateChange={setIsPlaying} 
                       onDurationChange={setDuration} 
